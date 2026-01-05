@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<1.6"]
+build-backend = "maturin"
+
+[project]
+name = "tiny-mp-cache"
+version = "0.1.1"
+description = "1μs Redis API cache (Unix socket)"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{name = "Nikita Ilin"}]
+
+[tool.maturin]
+module-name = "tiny_mp_cache"
+# python-source = "python"
