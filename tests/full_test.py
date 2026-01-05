@@ -2,37 +2,45 @@
 import multiprocessing as mp
 import time
 import json
-from tiny_mp_cache import serve, TinyCache
+from tiny_mp_cache import serve, serve_unix, TinyCache
 
-PORT = 5002
-ADDR = f"127.0.0.1:{PORT}"
+TCP_PORT = 5002
+TCP_ADDR = f"127.0.0.1:{TCP_PORT}"
+
+UDS_PATH = "/tmp/tiny-mp-cache-test.sock"
+UDS_ADDR = f"unix://{UDS_PATH}"
+
 N_JOBS = 1000
 N_WORKERS = 8
 WORK_TIME = 0.001  # 1 мс на задачу
 
 
-def server():
-    serve(PORT)
+def tcp_server():
+    serve(TCP_PORT)
+
+
+def uds_server():
+    serve_unix(UDS_PATH)
 
 
 def make_job_key(i: int) -> str:
     return f"job:{i}"
 
 
-def producer():
-    cache = TinyCache(ADDR)
+def producer(addr: str):
+    cache = TinyCache(addr)
     for i in range(N_JOBS):
         job = {"id": i, "payload": f"data-{i}"}
         cache.set(make_job_key(i), json.dumps(job).encode("utf-8"))
-    print(f"[PRODUCER] queued {N_JOBS} jobs")
+    print(f"[PRODUCER {addr}] queued {N_JOBS} jobs")
 
 
-def worker(worker_id: int, processed_ids):
+def worker(worker_id: int, addr: str, processed_ids):
     """
-    processed_ids — общая manager.list(), куда пишем id обработанных задач.
-    Используется только для проверки дубликатов, не для бизнес-логики. [web:110]
+    processed_ids — общая manager.list(), используется только для проверки
+    отсутствия повторной обработки задач, не для бизнес-логики. [web:110]
     """
-    cache = TinyCache(ADDR)
+    cache = TinyCache(addr)
     processed = 0
     while True:
         keys = cache.keys("job:*")
@@ -43,23 +51,22 @@ def worker(worker_id: int, processed_ids):
             if raw is None:
                 continue
             job = json.loads(raw.decode("utf-8"))
-            jid = job["id"]
-            processed_ids.append(jid)
+            processed_ids.append(job["id"])
             processed += 1
             time.sleep(WORK_TIME)
-    print(f"[WORKER {worker_id}] processed {processed} jobs")
+    print(f"[WORKER {worker_id} {addr}] processed {processed} jobs")
 
 
-def main():
+def run_load_test(name: str, addr: str, server_target):
+    print(f"\n=== {name} load test ===")
     mp.set_start_method("fork", force=True)
 
-    # стартуем сервер
-    srv = mp.Process(target=server, daemon=True)
+    srv = mp.Process(target=server_target, daemon=True)
     srv.start()
     time.sleep(0.5)
 
     t0 = time.time()
-    prod = mp.Process(target=producer)
+    prod = mp.Process(target=producer, args=(addr,))
     prod.start()
     prod.join()
 
@@ -67,7 +74,7 @@ def main():
         processed_ids = manager.list()
 
         workers = [
-            mp.Process(target=worker, args=(wid, processed_ids))
+            mp.Process(target=worker, args=(wid, addr, processed_ids))
             for wid in range(N_WORKERS)
         ]
         for p in workers:
@@ -81,6 +88,7 @@ def main():
         duplicates = len(ids) - len(unique_ids)
 
         print("\n=== STATS ===")
+        print(f"transport  : {name}")
         print(f"jobs       : {N_JOBS}")
         print(f"workers    : {N_WORKERS}")
         print(f"work_time  : {WORK_TIME:.3f} s per job")
@@ -95,7 +103,18 @@ def main():
         else:
             print("OK: no duplicate processing detected")
 
-    print("ALL DONE")
+    print(f"ALL DONE ({name})")
+
+
+def main():
+    # TCP
+    run_load_test("TCP", TCP_ADDR, tcp_server)
+
+    # UDS (только на Unix)
+    try:
+        run_load_test("UDS", UDS_ADDR, uds_server)
+    except (AttributeError, OSError):
+        print("\nUDS load test skipped (not supported on this platform)")
 
 
 if __name__ == "__main__":
