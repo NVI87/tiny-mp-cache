@@ -13,11 +13,16 @@ use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use bincode;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 /// =======================
 /// Команды и ответы
@@ -43,6 +48,40 @@ pub enum CacheResponse {
 }
 
 /// =======================
+/// Адрес транспорта
+/// =======================
+
+#[derive(Clone, Debug)]
+enum TransportAddr {
+    Tcp(String),     // "127.0.0.1:5002"
+    #[cfg(unix)]
+    Unix(PathBuf),   // "/tmp/tiny-mp-cache.sock"
+}
+
+impl TransportAddr {
+    /// Простейший парсер:
+    /// - "tcp://host:port" -> Tcp
+    /// - "unix:///path.sock" -> Unix (на Unix)
+    /// - "host:port" -> Tcp
+    fn parse(s: &str) -> Self {
+        if let Some(rest) = s.strip_prefix("tcp://") {
+            TransportAddr::Tcp(rest.to_string())
+        } else if let Some(rest) = s.strip_prefix("unix://") {
+            #[cfg(unix)]
+            {
+                TransportAddr::Unix(PathBuf::from(rest))
+            }
+            #[cfg(not(unix))]
+            {
+                TransportAddr::Tcp(rest.to_string())
+            }
+        } else {
+            TransportAddr::Tcp(s.to_string())
+        }
+    }
+}
+
+/// =======================
 /// Маппинг ошибок в Python
 /// =======================
 
@@ -51,103 +90,101 @@ fn map_error(e: CacheError, ctx: &str) -> PyErr {
 }
 
 /// =======================
-/// Клиентский TCP-транспорт
+/// Клиентский транспорт (TCP/UDS)
 /// =======================
 
-fn send_cmd_sync(addr: &str, cmd: CacheCommand) -> Result<CacheResponse, CacheError> {
-    let mut stream =
-        TcpStream::connect(addr).map_err(|e| CacheError::Network(e.to_string()))?;
+fn write_all(w: &mut impl Write, buf: &[u8]) -> Result<(), CacheError> {
+    w.write_all(buf)
+        .and_then(|_| w.flush())
+        .map_err(|e| CacheError::Network(e.to_string()))
+}
 
-    // Для локального кэша можно обойтись без жёстких таймаутов.
-    // stream.set_read_timeout(None).ok();
-    // stream.set_write_timeout(None).ok();
+fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<(), CacheError> {
+    r.read_exact(buf)
+        .map_err(|e| CacheError::Network(e.to_string()))
+}
 
+fn send_cmd_sync(addr: &TransportAddr, cmd: CacheCommand) -> Result<CacheResponse, CacheError> {
+    enum Conn {
+        Tcp(TcpStream),
+        #[cfg(unix)]
+        Unix(UnixStream),
+    }
+
+    // 1. устанавливаем соединение
+    let mut conn = match addr {
+        TransportAddr::Tcp(a) => {
+            let s = TcpStream::connect(a).map_err(|e| CacheError::Network(e.to_string()))?;
+            Conn::Tcp(s)
+        }
+        #[cfg(unix)]
+        TransportAddr::Unix(path) => {
+            let s = UnixStream::connect(path)
+                .map_err(|e| CacheError::Network(e.to_string()))?;
+            Conn::Unix(s)
+        }
+    };
+
+    // 2. кодируем команду
     let encoded_cmd =
         bincode::serialize(&cmd).map_err(|e| CacheError::Serialization(e.to_string()))?;
     let size = (encoded_cmd.len() as u32).to_le_bytes();
 
-    stream
-        .write_all(&size)
-        .and_then(|_| stream.write_all(&encoded_cmd))
-        .and_then(|_| stream.flush())
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    // 3. отправляем
+    match &mut conn {
+        Conn::Tcp(s) => {
+            write_all(s, &size)?;
+            write_all(s, &encoded_cmd)?;
+        }
+        #[cfg(unix)]
+        Conn::Unix(s) => {
+            write_all(s, &size)?;
+            write_all(s, &encoded_cmd)?;
+        }
+    }
 
+    // 4. читаем ответ
     let mut size_buf = [0u8; 4];
-    stream
-        .read_exact(&mut size_buf)
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    match &mut conn {
+        Conn::Tcp(s) => read_exact(s, &mut size_buf)?,
+        #[cfg(unix)]
+        Conn::Unix(s) => read_exact(s, &mut size_buf)?,
+    }
     let resp_size = u32::from_le_bytes(size_buf) as usize;
 
     let mut buf = vec![0u8; resp_size];
-    stream
-        .read_exact(&mut buf)
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    match &mut conn {
+        Conn::Tcp(s) => read_exact(s, &mut buf)?,
+        #[cfg(unix)]
+        Conn::Unix(s) => read_exact(s, &mut buf)?,
+    }
 
     bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))
 }
 
 /// =======================
-/// TCP-сервер
+/// Общая обработка соединения
 /// =======================
 
-#[pyfunction]
-fn serve(port: u16) -> PyResult<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    println!("🚀 TinyCache TCP server: {}", addr);
-
-    let listener = TcpListener::bind(&addr)
-        .map_err(|e| PyRuntimeError::new_err(format!("Bind error: {}", e)))?;
-
-    println!("🚀 TinyCache TCP ready: {}", addr);
-
-    let core = Arc::new(CacheCore::new());
-
-    for stream_res in listener.incoming() {
-        match stream_res {
-            Ok(mut stream) => {
-                let core_clone = core.clone();
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection(&mut stream, core_clone) {
-                        eprintln!("Connection error: {:?}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("Listener error: {}", e);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn handle_connection(
-    stream: &mut TcpStream,
+fn handle_connection_impl<S: Read + Write>(
+    stream: &mut S,
     core: Arc<CacheCore>,
 ) -> Result<(), CacheError> {
-    // stream.set_read_timeout(None).ok();
-    // stream.set_write_timeout(None).ok();
-
-    // 1) читаем длину команды
+    // 1) длина команды
     let mut size_buf = [0u8; 4];
-    stream
-        .read_exact(&mut size_buf)
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    read_exact(stream, &mut size_buf)?;
     let cmd_size = u32::from_le_bytes(size_buf) as usize;
     if cmd_size > 1_000_000 {
         return Err(CacheError::Internal("command too large".into()));
     }
 
-    // 2) читаем команду
+    // 2) команда
     let mut buf = vec![0u8; cmd_size];
-    stream
-        .read_exact(&mut buf)
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    read_exact(stream, &mut buf)?;
     let cmd: CacheCommand =
         bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
-    // 3) обрабатываем
+    // 3) обработка
     let resp = match cmd {
         CacheCommand::Set(key, value) => {
             core.set(key, value);
@@ -173,16 +210,105 @@ fn handle_connection(
         CacheCommand::Len => CacheResponse::Int(core.len()),
     };
 
-    // 4) отправляем ответ
+    // 4) ответ
     let encoded =
         bincode::serialize(&resp).map_err(|e| CacheError::Serialization(e.to_string()))?;
     let size = (encoded.len() as u32).to_le_bytes();
 
-    stream
-        .write_all(&size)
-        .and_then(|_| stream.write_all(&encoded))
-        .and_then(|_| stream.flush())
-        .map_err(|e| CacheError::Network(e.to_string()))?;
+    write_all(stream, &size)?;
+    write_all(stream, &encoded)?;
+    Ok(())
+}
+
+fn handle_connection(
+    stream: &mut TcpStream,
+    core: Arc<CacheCore>,
+) -> Result<(), CacheError> {
+    handle_connection_impl(stream, core)
+}
+
+#[cfg(unix)]
+fn handle_connection_unix(
+    stream: &mut UnixStream,
+    core: Arc<CacheCore>,
+) -> Result<(), CacheError> {
+    handle_connection_impl(stream, core)
+}
+
+/// =======================
+/// TCP-сервер
+/// =======================
+
+#[pyfunction]
+fn serve(port: u16) -> PyResult<()> {
+    let addr = format!("127.0.0.1:{}", port);
+    println!("🚀 TinyCache TCP server: {}", addr);
+
+    let listener = TcpListener::bind(&addr)
+        .map_err(|e| PyRuntimeError::new_err(format!("Bind error: {}", e)))?;
+
+    println!("🚀 TinyCache TCP ready: {}", addr);
+
+    let core = Arc::new(CacheCore::new());
+
+    for stream_res in listener.incoming() {
+        match stream_res {
+            Ok(mut stream) => {
+                let core_clone = core.clone();
+                thread::spawn(move || {
+                    if let Err(e) = handle_connection(&mut stream, core_clone) {
+                        eprintln!("TCP connection error: {:?}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("TCP listener error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// =======================
+/// UDS-сервер (только Unix)
+/// =======================
+
+#[cfg(unix)]
+#[pyfunction]
+fn serve_unix(path: String) -> PyResult<()> {
+    let sock_path = PathBuf::from(path);
+    if sock_path.exists() {
+        fs::remove_file(&sock_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Remove old socket: {}", e)))?;
+    }
+
+    println!("🚀 TinyCache UDS server: {:?}", sock_path);
+
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Bind UDS error: {}", e)))?;
+
+    println!("🚀 TinyCache UDS ready: {:?}", sock_path);
+
+    let core = Arc::new(CacheCore::new());
+
+    for stream_res in listener.incoming() {
+        match stream_res {
+            Ok(mut stream) => {
+                let core_clone = core.clone();
+                thread::spawn(move || {
+                    if let Err(e) = handle_connection_unix(&mut stream, core_clone) {
+                        eprintln!("UDS connection error: {:?}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("UDS listener error: {}", e);
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -194,19 +320,21 @@ fn handle_connection(
 #[pyclass]
 #[derive(Clone)]
 pub struct TinyCache {
-    addr: String, // "host:port"
+    addr: TransportAddr,
 }
 
 #[pymethods]
 impl TinyCache {
+    /// addr:
+    ///   - "127.0.0.1:5002" или "tcp://127.0.0.1:5002" для TCP
+    ///   - "unix:///tmp/tiny-mp-cache.sock" для Unix-socket (на Unix)
     #[new]
     fn new(addr: String) -> Self {
-        // маленький sleep для fork-сценариев
         thread::sleep(Duration::from_millis(10));
+        let addr = TransportAddr::parse(&addr);
         Self { addr }
     }
 
-    /// set(key: str, value: bytes) -> None
     fn set(&self, key: String, value: &[u8]) -> PyResult<()> {
         let v = value.to_vec();
         match send_cmd_sync(&self.addr, CacheCommand::Set(key, v)) {
@@ -219,7 +347,6 @@ impl TinyCache {
         }
     }
 
-    /// get(key: str) -> Optional[bytes]
     fn get<'py>(
         &self,
         py: Python<'py>,
@@ -227,7 +354,7 @@ impl TinyCache {
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         match send_cmd_sync(&self.addr, CacheCommand::Get(key)) {
             Ok(CacheResponse::Value(v)) => {
-                let b = PyBytes::new_bound(py, &v); // актуальный API [web:40][web:66]
+                let b = PyBytes::new_bound(py, &v);
                 Ok(Some(b))
             }
             Ok(CacheResponse::Nil) => Ok(None),
@@ -239,7 +366,6 @@ impl TinyCache {
         }
     }
 
-    /// pop(key: str) -> Optional[bytes]
     fn pop<'py>(
         &self,
         py: Python<'py>,
@@ -259,7 +385,6 @@ impl TinyCache {
         }
     }
 
-    /// delete(key: str) -> int
     fn delete(&self, key: String) -> PyResult<i64> {
         match send_cmd_sync(&self.addr, CacheCommand::Del(key)) {
             Ok(CacheResponse::Int(n)) => Ok(n),
@@ -271,7 +396,6 @@ impl TinyCache {
         }
     }
 
-    /// keys(pattern: str) -> list[str]
     fn keys(&self, pattern: String) -> PyResult<Vec<String>> {
         match send_cmd_sync(&self.addr, CacheCommand::Keys(pattern)) {
             Ok(CacheResponse::Keys(keys)) => Ok(keys),
@@ -283,7 +407,6 @@ impl TinyCache {
         }
     }
 
-    /// len(self) -> int
     fn len(&self) -> PyResult<i64> {
         match send_cmd_sync(&self.addr, CacheCommand::Len) {
             Ok(CacheResponse::Int(n)) => Ok(n),
@@ -304,5 +427,7 @@ impl TinyCache {
 fn tiny_mp_cache(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TinyCache>()?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
+    #[cfg(unix)]
+    m.add_function(wrap_pyfunction!(serve_unix, m)?)?;
     Ok(())
 }
