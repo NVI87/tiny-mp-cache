@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tiny-mp-cache"
-version = "0.1.4"
+version = "0.1.5"
 description = "1μs Redis API cache (Unix socket)"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
@@ -19,7 +19,8 @@ classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Operating System :: OS Independent",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
   "License :: OSI Approved :: MIT License",
 ]
 

@@ -274,16 +274,38 @@ fn handle_connection_unix(
 }
 
 /// =======================
+/// Резолвинг директории журналирования
+/// =======================
+fn resolve_wal_path(wal_dir: Option<String>, file_name: &str) -> PyResult<PathBuf> {
+    let dir = if let Some(dir_str) = wal_dir {
+        PathBuf::from(dir_str)
+    } else {
+        // как раньше: просто кладём в текущую директорию
+        std::env::current_dir()
+            .map_err(|e| PyRuntimeError::new_err(format!("current_dir error: {}", e)))?
+    };
+
+    if !dir.exists() {
+        fs::create_dir_all(&dir)
+            .map_err(|e| PyRuntimeError::new_err(format!("create wal_dir error: {}", e)))?;
+    }
+
+    Ok(dir.join(file_name))
+}
+
+/// =======================
 /// TCP-сервер
 /// =======================
 
-#[pyfunction]
-fn serve(port: u16) -> PyResult<()> {
+#[pyfunction(signature = (port, wal_dir=None))]
+fn serve(port: u16, wal_dir: Option<String>) -> PyResult<()> {
     let addr = format!("127.0.0.1:{}", port);
     println!("🚀 TinyCache TCP server: {}", addr);
 
     // путь WAL можно потом вынести в конфиг/ENV
-    let wal_path = PathBuf::from("tiny-mp-cache.wal");
+    // let wal_path = PathBuf::from("tiny-mp-cache.wal");
+
+    let wal_path = resolve_wal_path(wal_dir, "tiny-mp-cache.wal")?;
     let core = Arc::new(
         PersistentCore::new(wal_path)
             .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
@@ -319,8 +341,8 @@ fn serve(port: u16) -> PyResult<()> {
 /// =======================
 
 #[cfg(unix)]
-#[pyfunction]
-fn serve_unix(path: String) -> PyResult<()> {
+#[pyfunction(signature = (path, wal_dir=None))]
+fn serve_unix(path: String, wal_dir: Option<String>) -> PyResult<()> {
     let sock_path = PathBuf::from(&path);
     if sock_path.exists() {
         fs::remove_file(&sock_path)
@@ -329,7 +351,8 @@ fn serve_unix(path: String) -> PyResult<()> {
 
     println!("🚀 TinyCache UDS server: {:?}", sock_path);
 
-    let wal_path = PathBuf::from("tiny-mp-cache-uds.wal");
+    // let wal_path = PathBuf::from("tiny-mp-cache.wal");
+    let wal_path = resolve_wal_path(wal_dir, "tiny-mp-cache.wal")?;
     let core = Arc::new(
         PersistentCore::new(wal_path)
             .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
