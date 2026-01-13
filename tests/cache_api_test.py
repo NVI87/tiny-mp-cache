@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import multiprocessing as mp
+import os
 import time
 from tiny_mp_cache import serve, serve_unix, TinyCache  # serve_unix доступен только на Unix
 
@@ -10,13 +11,44 @@ TCP_ADDR = f"127.0.0.1:{TCP_PORT}"
 UDS_PATH = "/tmp/tiny-mp-cache-test.sock"
 UDS_ADDR = f"unix://{UDS_PATH}"
 
+def uds_server(stop_event: mp.Event, wal_path: str | None = None):
+    while not stop_event.is_set():
+        try:
+            if os.path.exists(UDS_PATH):
+                os.remove(UDS_PATH)
+            serve_unix(UDS_PATH)
+            # нормальное завершение — выходим из цикла
+            break
+        except Exception as e:
+            print(f"[SUPERVISOR] server crashed with {e!r}, restarting in 1s")
+            # если уже попросили остановиться — не рестартуём
+            if stop_event.is_set():
+                break
+            time.sleep(1.0)
 
-def tcp_server():
-    serve(TCP_PORT)
+    print("[SUPERVISOR] loop stopped")
 
+def tcp_server(stop_event: mp.Event, wal_path: str | None = None):
+    while not stop_event.is_set():
+        try:
+            serve(TCP_PORT)
+            # нормальное завершение — выходим из цикла
+            break
+        except Exception as e:
+            print(f"[SUPERVISOR] server crashed with {e!r}, restarting in 1s")
+            # если уже попросили остановиться — не рестартуём
+            if stop_event.is_set():
+                break
+            time.sleep(1.0)
 
-def uds_server():
-    serve_unix(UDS_PATH)
+    print("[SUPERVISOR] loop stopped")
+
+# def tcp_server():
+#     serve(TCP_PORT)
+#
+#
+# def uds_server():
+#     serve_unix(UDS_PATH)
 
 
 def run_api_tests(addr: str):
@@ -65,18 +97,25 @@ def run_api_tests(addr: str):
 def main():
     mp.set_start_method("fork", force=True)
 
+    wal_dir = os.getcwd()
     # --- TCP ---
-    srv_tcp = mp.Process(target=tcp_server, daemon=True)
+    tcp_stop_event = mp.Event()
+    srv_tcp = mp.Process(target=tcp_server, args=(tcp_stop_event, wal_dir), daemon=True)
     srv_tcp.start()
     time.sleep(0.5)
     run_api_tests(TCP_ADDR)
+    tcp_stop_event.set()
+    srv_tcp.join(timeout=1)
 
     # --- UDS (только на Unix) ---
     try:
-        srv_uds = mp.Process(target=uds_server, daemon=True)
+        uds_stop_event = mp.Event()
+        srv_uds = mp.Process(target=uds_server, args=(uds_stop_event, wal_dir), daemon=True)
         srv_uds.start()
         time.sleep(0.5)
         run_api_tests(UDS_ADDR)
+        uds_stop_event.set()
+        srv_uds.join(timeout=1)
     except (AttributeError, OSError):
         # на non-Unix serve_unix может не существовать / не работать
         print("UDS tests skipped (not supported on this platform)")

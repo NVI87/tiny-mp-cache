@@ -4,12 +4,27 @@ build-backend = "maturin"
 
 [project]
 name = "tiny-mp-cache"
-version = "0.1.1"
+version = "0.1.5"
 description = "1μs Redis API cache (Unix socket)"
 requires-python = ">=3.8"
-license = "MIT"
+license = {file = "LICENSE"}
 authors = [{name = "Nikita Ilin"}]
+readme = "README.md"
 
 [tool.maturin]
 module-name = "tiny_mp_cache"
-# python-source = "python"
+python-packages = ["tiny_mp_cache"]
+
+classifiers = [
+  "Programming Language :: Python",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/NVI87/tiny-mp-cache"
+Source = "https://github.com/NVI87/tiny-mp-cache"
