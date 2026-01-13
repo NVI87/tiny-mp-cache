@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Build wheels (${{ matrix.os }} / ${{ matrix.arch }} / py${{ matrix.python-version }})
+    name: Build wheels (${{ matrix.os }} / ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -16,26 +16,23 @@ jobs:
           # Linux x86_64
           - os: ubuntu-latest
             arch: x86_64
-            python-version: "3.11"
           # Linux aarch64
           - os: ubuntu-latest
             arch: aarch64
-            python-version: "3.11"
           # macOS x86_64
           - os: macos-latest
             arch: x86_64
-            python-version: "3.11"
           # macOS arm64
           - os: macos-latest
             arch: arm64
-            python-version: "3.11"
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          # Один Python, потому что abi3-py39 даёт один бинарь для >=3.9
+          python-version: "3.11"
 
       - name: Install tools
         run: |
@@ -47,7 +44,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.arch == 'x86_64'
         run: |
           docker run --rm -v "$PWD":/io ghcr.io/pyo3/maturin \
-            build --release --manylinux 2014 --compatibility pypi
+            build --release --manylinux 2014
 
       # Linux aarch64 (manylinux, cross)
       - name: Build Linux aarch64 wheels
@@ -55,7 +52,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --manylinux 2014 --compatibility pypi -i python${{ matrix.python-version }}
+          args: --release --manylinux 2014 -i python3.11
           target: aarch64
 
       # macOS x86_64
