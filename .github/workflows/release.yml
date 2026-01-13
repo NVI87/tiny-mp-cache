@@ -15,10 +15,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python-version: ["3.9", "3.10", "3.11"]
         include:
-          # Linux aarch64: отдельная job внутрь ubuntu (через maturin-action)
+          # отдельная запись для linux/aarch64
           - os: ubuntu-latest
             python-version: "3.11"
             target: "aarch64"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,18 +27,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install maturin
+      - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          pip install maturin
+          pip install maturin build
 
-      # Linux x86_64 (host arch)
+      # Linux x86_64 (manylinux через Docker)
       - name: Build Linux x86_64 wheels
         if: matrix.os == 'ubuntu-latest' && !contains(matrix, 'target')
         run: |
-          maturin build --release --manylinux 2014 --compatibility pypi
+          docker run --rm -v "$PWD":/io ghcr.io/pyo3/maturin \
+            build --release --manylinux 2014 --compatibility pypi
 
-      # Linux aarch64 (кросс-сборка)
+      # Linux aarch64 (manylinux, кросс-сборка)
       - name: Build Linux aarch64 wheels
         if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64'
         uses: PyO3/maturin-action@v1
@@ -52,11 +54,10 @@ jobs:
         run: |
           maturin build --release --universal2
 
-      # sdist только один раз (чтобы не дублировать)
+      # sdist — один раз
       - name: Build sdist
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         run: |
-          python -m pip install build
           python -m build --sdist
 
       - name: Upload artifacts
@@ -67,6 +68,7 @@ jobs:
             target/wheels/*.whl
             dist/*.tar.gz
           if-no-files-found: ignore
+
   publish:
     needs: build
     runs-on: ubuntu-latest
