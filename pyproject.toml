@@ -4,15 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "tiny-mp-cache"
-version = "0.1.3"
+version = "0.1.4"
 description = "1μs Redis API cache (Unix socket)"
 requires-python = ">=3.8"
-license = "MIT"
+license = {file = "LICENSE"}
 authors = [{name = "Nikita Ilin"}]
+readme = "README.md"
 
 [tool.maturin]
 module-name = "tiny_mp_cache"
-# python-source = "python"
 
 classifiers = [
   "Programming Language :: Python",

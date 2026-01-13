@@ -3,18 +3,31 @@
 `tiny-mp-cache` — минималистичный k/v‑кэш на Rust с Python‑клиентом.  
 Он рассчитан на использование как локальный сервис кэширования между несколькими Python‑процессами (например, воркерами `multiprocessing`) в одном pod’е или на одной машине.
 
-Основные цели:
+Поддерживаются два транспорта:
 
-- надёжное и предсказуемое поведение;
-- простой и чёткий API;
-- возможность поднять сервер в отдельном процессе одной строкой из Python;
-- производительность уровня Rust.
+- TCP (`serve(port)`, адрес вида `"127.0.0.1:5002"`);
+- Unix domain socket (`serve_unix(path)`, адрес вида `"unix:///tmp/tiny-mp-cache.sock"`).
 
----
+***
 
-## Установка
+## Установка из PyPI
 
-Проект собирается через `maturin` и `PyO3` (Rust‑расширение для Python).
+После публикации пакет можно ставить напрямую:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # или .venv\Scripts\activate на Windows
+
+pip install tiny-mp-cache
+```
+
+Модуль `tiny_mp_cache` станет доступен во всех скриптах в этом окружении.
+
+***
+
+## Локальная сборка из исходников
+
+Проект использует `maturin` и `PyO3` (Rust‑расширение для Python).
 
 ```bash
 python -m venv .venv
@@ -25,12 +38,16 @@ pip install maturin
 # установка расширения в текущий venv (editable-режим)
 maturin develop --release
 ```
-После этого модуль tiny_mp_cache доступен в Python в этом виртуальном окружении.
 
-При изменении Rust‑кода библиотеку нужно пересобирать повторным запуском maturin develop или maturin develop --release.
+После этого модуль `tiny_mp_cache` доступен в Python в этом виртуальном окружении.  
+При изменении Rust‑кода библиотеку нужно пересобирать повторным запуском `maturin develop` или `maturin develop --release`.
 
-Быстрый старт
-Запуск сервера из Python
+***
+
+## Быстрый старт: TCP‑сервер
+
+Запуск сервера и использование кэша по TCP.
+
 ```python
 import multiprocessing as mp
 import time
@@ -61,71 +78,131 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 ```
-serve(port) поднимает один TCP‑сервер на 127.0.0.1:port.
 
-TinyCache — клиентский класс, который ходит к этому серверу по TCP.
+`serve(port)` поднимает один TCP‑сервер на `127.0.0.1:port`.  
+`TinyCache` — клиентский класс, который ходит к этому серверу по TCP.
 
-API Python‑клиента
+***
+
+## Быстрый старт: Unix domain socket
+
+Пример запуска сервера и клиента через Unix‑сокет.
+
+```python
+import multiprocessing as mp
+import time
+import os
+from tiny_mp_cache import serve_unix, TinyCache
+
+SOCK_PATH = os.path.join(os.getcwd(), "tiny-mp-cache-test.sock")
+UDS_ADDR = f"unix://{SOCK_PATH}"
+
+
+def server():
+    # при необходимости удаляем старый сокет
+    if os.path.exists(SOCK_PATH):
+        os.remove(SOCK_PATH)
+    # сервер слушает Unix-сокет по заданному пути
+    serve_unix(SOCK_PATH)
+
+
+def main():
+    mp.set_start_method("fork", force=True)  # для Linux/macOS
+
+    srv = mp.Process(target=server, daemon=True)
+    srv.start()
+    time.sleep(0.5)
+
+    cache = TinyCache(UDS_ADDR)
+    cache.set("foo", b"bar")
+    value = cache.get("foo")
+    print(value)  # b'bar'
+
+
+if __name__ == "__main__":
+    main()
+```
+
+В `serve_unix` передаётся файловый путь (`/tmp/…` или путь в `os.getcwd()`),  
+а в `TinyCache` — URI с префиксом `unix://…`.
+
+***
+
+## API Python‑клиента
+
 ```python
 from tiny_mp_cache import TinyCache
 
-cache = TinyCache("127.0.0.1:5002")
-
+cache_tcp = TinyCache("127.0.0.1:5002")
+cache_uds = TinyCache("unix:///tmp/tiny-mp-cache.sock")
 ```
 
-Ключи — строки (str).
-Значения — байты (bytes). Сериализацию/десериализацию объектов (JSON, pickle и т.п.) контролирует приложение.
+- Ключи — строки (`str`).
+- Значения — байты (`bytes`). Сериализацию/десериализацию объектов (JSON, pickle и т.п.) контролирует приложение.
 
-set(key: str, value: bytes) -> None
+### set(key: str, value: bytes) -> None
+
 Сохраняет значение по ключу.
 
 ```python
 cache.set("user:1", b"payload")
-get(key: str) -> Optional[bytes]
 ```
-Возвращает значение по ключу или None, если ключа нет.
+
+### get(key: str) -> Optional[bytes]
+
+Возвращает значение по ключу или `None`, если ключа нет.
 
 ```python
 value = cache.get("user:1")
 if value is not None:
     print(value.decode("utf-8"))
-pop(key: str) -> Optional[bytes]
 ```
+
+### pop(key: str) -> Optional[bytes]
+
 Атомарно забирает значение и удаляет ключ.
 
-Гарантия: если несколько воркеров одновременно вызывают pop для одного и того же ключа, значение получит ровно один из них.
+Гарантия: если несколько воркеров одновременно вызывают `pop` для одного и того же ключа, значение получит ровно один из них.
 
 ```python
 job_raw = cache.pop("job:123")
 if job_raw is not None:
     job = job_raw.decode("utf-8")
-delete(key: str) -> int
 ```
+
+### delete(key: str) -> int
+
 Удаляет ключ.
 
-1 — ключ существовал и был удалён;
-
-0 — ключа не было.
+- `1` — ключ существовал и был удалён;
+- `0` — ключа не было.
 
 ```python
 deleted = cache.delete("user:1")
-keys(pattern: str) -> list[str]
 ```
-Возвращает список ключей, подходящих под паттерн.
-Сейчас поддерживается только префиксный паттерн вида "prefix*".
+
+### keys(pattern: str) -> list[str]
+
+Возвращает список ключей, подходящих под паттерн.  
+Сейчас поддерживается только префиксный паттерн вида `"prefix*"`.
 
 ```python
 jobs = cache.keys("job:*")
-len() -> int
 ```
+
+### len() -> int
+
 Возвращает количество ключей в кэше.
 
 ```python
 print(cache.len())
 ```
-Пример: продюсер и воркеры
+
+***
+
+## Пример: продюсер и воркеры (TCP)
+
 Пример использования кэша как простой очереди задач между несколькими процессами.
 
 ```python
@@ -225,16 +302,21 @@ def main():
 if __name__ == "__main__":
     main()
 ```
-Запуск тестов
+
+***
+
+## Запуск тестов
+
 В репозитории есть два тестовых скрипта:
 
-tests/cache_api_test.py — проверяет базовый API (set/get/pop/delete/keys/len) в одном процессе;
+- `tests/cache_api_test.py` — проверяет базовый API (`set`/`get`/`pop`/`delete`/`keys`/`len`) в одном процессе;
+- `tests/full_test.py` — нагрузочный многопроцессный сценарий с продюсером и воркерами.
 
-tests/full_test.py — нагрузочный многопроцессный сценарий с продюсером и воркерами.
-
-Перед запуском убедись, что активирован тот же venv, куда ставился пакет через maturin develop.
+Перед запуском убедись, что активирован тот же venv, куда ставился пакет через `maturin develop` или установлен `tiny-mp-cache` из PyPI.
 
 ```bash
 python tests/cache_api_test.py
 python tests/full_test.py
 ```
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/141613206/a38f3bab-bfa8-4ab8-bd63-63bcef40210d/image.jpg)
