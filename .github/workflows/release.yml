@@ -7,18 +7,28 @@ on:
 
 jobs:
   build:
-    name: Build wheels (${{ matrix.os }} / py${{ matrix.python-version }})
+    name: Build wheels (${{ matrix.os }} / ${{ matrix.arch }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.9", "3.10", "3.11"]
         include:
-          # отдельная запись для linux/aarch64
+          # Linux x86_64
           - os: ubuntu-latest
+            arch: x86_64
             python-version: "3.11"
-            target: "aarch64"
+          # Linux aarch64
+          - os: ubuntu-latest
+            arch: aarch64
+            python-version: "3.11"
+          # macOS x86_64
+          - os: macos-latest
+            arch: x86_64
+            python-version: "3.11"
+          # macOS arm64
+          - os: macos-latest
+            arch: arm64
+            python-version: "3.11"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,38 +42,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install maturin build
 
-      # Linux x86_64 (manylinux через Docker)
+      # Linux x86_64 (manylinux via Docker)
       - name: Build Linux x86_64 wheels
-        if: matrix.os == 'ubuntu-latest' && !contains(matrix, 'target')
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'x86_64'
         run: |
           docker run --rm -v "$PWD":/io ghcr.io/pyo3/maturin \
             build --release --manylinux 2014 --compatibility pypi
 
-      # Linux aarch64 (manylinux, кросс-сборка)
+      # Linux aarch64 (manylinux, cross)
       - name: Build Linux aarch64 wheels
-        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64'
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'aarch64'
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --manylinux 2014 --compatibility pypi -i python${{ matrix.python-version }}
           target: aarch64
 
-      # macOS universal2 (x86_64 + arm64)
-      - name: Build macOS wheels (universal2)
-        if: matrix.os == 'macos-latest'
+      # macOS x86_64
+      - name: Build macOS x86_64 wheels
+        if: matrix.os == 'macos-latest' && matrix.arch == 'x86_64'
         run: |
-          maturin build --release --universal2
+          maturin build --release
 
-      # sdist — один раз
+      # macOS arm64
+      - name: Build macOS arm64 wheels
+        if: matrix.os == 'macos-latest' && matrix.arch == 'arm64'
+        run: |
+          rustup target add aarch64-apple-darwin
+          maturin build --release --target aarch64-apple-darwin
+
+      # sdist один раз (на linux x86_64)
       - name: Build sdist
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'x86_64'
         run: |
           python -m build --sdist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.os }}-py${{ matrix.python-version }}${{ matrix.target }}
+          name: dist-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             target/wheels/*.whl
             dist/*.tar.gz
