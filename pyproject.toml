@@ -13,6 +13,7 @@ readme = "README.md"
 
 [tool.maturin]
 module-name = "tiny_mp_cache"
+python-packages = ["tiny_mp_cache"]
 
 classifiers = [
   "Programming Language :: Python",
