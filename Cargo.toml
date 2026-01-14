@@ -1,6 +1,6 @@
 [package]
 name = "tiny-mp-cache"
-version = "0.1.6"
+version = "0.1.8"
 edition = "2021"
 authors = ["Nikita Ilin <nv.ilyn@gmail.com>"]
 description = "Tiny multiprocessing-friendly cache over TCP, exposed to Python via PyO3"

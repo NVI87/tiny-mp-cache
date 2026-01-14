@@ -31,7 +31,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # Один Python, потому что abi3-py39 даёт один бинарь для >=3.9
+          # Один Python, т.к. pyo3 с abi3-py39 даёт один бинарь для >=3.9
           python-version: "3.11"
 
       - name: Install tools
@@ -90,7 +90,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: dist-raw
+
+      - name: Collect distributions
+        run: |
+          mkdir -p dist
+          find dist-raw -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} dist/ \;
+          ls -R dist
 
       - name: Publish distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
