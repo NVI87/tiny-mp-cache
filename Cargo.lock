@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-mp-cache"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bincode",
  "dashmap",
