@@ -1,7 +1,7 @@
 use crate::core::{CacheCore, KeyMeta};
 use crate::error::CacheError;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -140,6 +140,7 @@ pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// Загрузить мету ключей из keys.bin (опционально, как быстрый хинт).
 pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     if !keys_path.exists() {
@@ -226,5 +227,58 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
     }
     fs::rename(&tmp, &keys_path)
         .map_err(|e| CacheError::Internal(format!("rename keys.tmp: {}", e)))?;
+    Ok(())
+}
+
+/// Полноценное восстановление: последний snapshot + WAL.
+pub fn load_latest_snapshot_into_core(
+    paths: &Paths,
+    state: &StateMeta,
+    core: &CacheCore,
+) -> Result<(), CacheError> {
+    if state.snapshots.is_empty() {
+        return Ok(());
+    }
+    let last_id = *state
+        .snapshots
+        .last()
+        .expect("snapshots non-empty but .last() failed");
+    let snap_path = paths.snapshot_file(last_id);
+    if !snap_path.exists() {
+        // состояние разрушено/почищено — ничего не делаем
+        return Ok(());
+    }
+
+    let mut f = File::open(&snap_path)
+        .map_err(|e| CacheError::Internal(format!("open snapshot: {}", e)))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| CacheError::Internal(format!("read snapshot: {}", e)))?;
+
+    #[derive(Deserialize)]
+    struct SnapshotFile {
+        format_version: u32,
+        entries: Vec<(String, Vec<u8>, i64)>, // (key, value, ttl_ms)
+    }
+
+    let file: SnapshotFile =
+        bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
+
+    if file.format_version != StateMeta::CURRENT_VERSION {
+        return Err(CacheError::Internal(format!(
+            "unsupported snapshot version: {}",
+            file.format_version
+        )));
+    }
+
+    for (key, value, ttl_ms) in file.entries {
+        let ttl = if ttl_ms < 0 {
+            None
+        } else {
+            Some(Duration::from_millis(ttl_ms as u64))
+        };
+        core.set(key, value, ttl);
+    }
+
     Ok(())
 }

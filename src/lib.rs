@@ -9,7 +9,10 @@ mod meta;
 use crate::core::CacheCore;
 use crate::error::CacheError;
 use crate::wal::{Wal, WalRecord};
-use crate::meta::{Paths, StateMeta, load_or_init_state, load_keys_meta, save_keys_meta};
+use crate::meta::{
+    Paths, StateMeta, load_or_init_state, load_keys_meta, save_keys_meta,
+    load_latest_snapshot_into_core,
+};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -102,8 +105,13 @@ impl PersistentCore {
         let state = load_or_init_state(&paths, snapshot_interval_secs, retention_snapshots)?;
         let core = CacheCore::new();
 
-        load_keys_meta(&paths, &core)?;
+        // 1) восстановление из последнего snapshot
+        load_latest_snapshot_into_core(&paths, &state, &core)?;
 
+        // 2) опционально доинициализируем мету из keys.bin (можно вообще выкинуть)
+        let _ = load_keys_meta(&paths, &core);
+
+        // 3) WAL поверх снапшота
         let wal = Wal::open(paths.wal_log())?;
         wal.replay(&core)?;
 
@@ -162,22 +170,19 @@ impl PersistentCore {
         paths: &Paths,
         retention: u64,
     ) -> Result<(), CacheError> {
-        // 1) выгружаем live‑состояние
         let live = core.export_live_with_values();
 
         #[derive(Serialize)]
         struct SnapshotFile {
             format_version: u32,
-            entries: Vec<(String, Vec<u8>, i64)>, // (key, value, ttl_ms)
+            entries: Vec<(String, Vec<u8>, i64)>,
         }
 
-        let now = Instant::now();
         let entries: Vec<(String, Vec<u8>, i64)> = live
             .into_iter()
             .map(|(k, v, ttl)| {
                 let ttl_ms = ttl
                     .and_then(|d| {
-                        // ttl уже duration «от сейчас»
                         if d.as_millis() <= 0 {
                             None
                         } else {
@@ -190,7 +195,7 @@ impl PersistentCore {
             .collect();
 
         let mut state = state_arc.lock().unwrap();
-        let snapshot_id = now.elapsed().as_millis() as u64 + state.current_snapshot_id + 1;
+        let snapshot_id = state.current_snapshot_id + 1;
         state.current_snapshot_id = snapshot_id;
         state.snapshots.push(snapshot_id);
 
@@ -214,10 +219,8 @@ impl PersistentCore {
         std::fs::rename(&tmp, &snap_path)
             .map_err(|e| CacheError::Internal(format!("rename snapshot.tmp: {}", e)))?;
 
-        // 2) сохраняем keys.bin
         save_keys_meta(paths, core)?;
 
-        // 3) retention
         if retention > 0 && state.snapshots.len() as u64 > retention {
             let to_remove = state.snapshots.len() as u64 - retention;
             for _ in 0..to_remove {
@@ -229,10 +232,8 @@ impl PersistentCore {
             }
         }
 
-        // 4) сохраняем state.json
         crate::meta::save_state(paths, &state)?;
 
-        // 5) обнуляем WAL
         wal.reset()?;
 
         Ok(())
