@@ -4,10 +4,12 @@
 mod core;
 mod error;
 mod wal;
+mod meta;
 
 use crate::core::CacheCore;
-use crate::wal::{Wal, WalRecord};
 use crate::error::CacheError;
+use crate::wal::{Wal, WalRecord};
+use crate::meta::{Paths, StateMeta, load_or_init_state, load_keys_meta};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -87,18 +89,41 @@ impl TransportAddr {
 pub struct PersistentCore {
     core: CacheCore,
     wal: Wal,
+    #[allow(dead_code)]
+    state: StateMeta,
+    #[allow(dead_code)]
+    paths: Paths,
 }
 
 impl PersistentCore {
-    pub fn new(wal_path: PathBuf) -> Result<Self, CacheError> {
+    pub fn new(
+        data_dir: PathBuf,
+        snapshot_interval_secs: u64,
+        retention_chunks: u64,
+    ) -> Result<Self, CacheError> {
+        // Настроить директории
+        let paths = Paths::new(&data_dir)?;
+
+        // Загрузить/инициализировать state.json
+        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
+
+        // Создать ядро и загрузить мету ключей
         let core = CacheCore::new();
-        let wal = Wal::open(wal_path)?;
-        // при старте доигрываем WAL
+        load_keys_meta(&paths, &core)?;
+
+        // Открыть WAL и доиграть его
+        let wal = Wal::open(paths.wal_log())?;
         wal.replay(&core)?;
-        Ok(Self { core, wal })
+
+        Ok(Self {
+            core,
+            wal,
+            state,
+            paths,
+        })
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), CacheError> {
+    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<std::time::Duration>) -> Result<(), CacheError> {
         let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
         self.wal.append(&WalRecord::Set {
             key: key.clone(),
@@ -288,47 +313,32 @@ fn handle_connection_unix(
 }
 
 /// =======================
-/// Резолвинг директории журналирования
-/// =======================
-fn resolve_wal_path(wal_dir: Option<String>, file_name: &str) -> PyResult<PathBuf> {
-    let dir = if let Some(dir_str) = wal_dir {
-        PathBuf::from(dir_str)
-    } else {
-        // как раньше: просто кладём в текущую директорию
-        std::env::current_dir()
-            .map_err(|e| PyRuntimeError::new_err(format!("current_dir error: {}", e)))?
-    };
-
-    if !dir.exists() {
-        fs::create_dir_all(&dir)
-            .map_err(|e| PyRuntimeError::new_err(format!("create wal_dir error: {}", e)))?;
-    }
-
-    Ok(dir.join(file_name))
-}
-
-/// =======================
 /// TCP-сервер
 /// =======================
 
-#[pyfunction(signature = (port, wal_dir=None))]
-fn serve(port: u16, wal_dir: Option<String>) -> PyResult<()> {
+#[pyfunction(signature = (data_dir, port=5002, snapshot_interval_secs=60, retention_chunks=3))]
+fn serve(
+    data_dir: String,
+    port: u16,
+    snapshot_interval_secs: u64,
+    retention_chunks: u64,
+) -> PyResult<()> {
     let addr = format!("127.0.0.1:{}", port);
-    println!("🚀 TinyCache TCP server: {}", addr);
+    println!("TinyCache TCP server: {}", addr);
 
-    // путь WAL можно потом вынести в конфиг/ENV
-    // let wal_path = PathBuf::from("tiny-mp-cache.wal");
-
-    let wal_path = resolve_wal_path(wal_dir, "tiny-mp-cache.wal")?;
     let core = Arc::new(
-        PersistentCore::new(wal_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
+        PersistentCore::new(
+            PathBuf::from(&data_dir),
+            snapshot_interval_secs,
+            retention_chunks,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
     );
 
     let listener = TcpListener::bind(&addr)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind error: {}", e)))?;
 
-    println!("🚀 TinyCache TCP ready: {}", addr);
+    println!("TinyCache TCP ready: {}", addr);
 
     for stream_res in listener.incoming() {
         match stream_res {
@@ -355,27 +365,35 @@ fn serve(port: u16, wal_dir: Option<String>) -> PyResult<()> {
 /// =======================
 
 #[cfg(unix)]
-#[pyfunction(signature = (path, wal_dir=None))]
-fn serve_unix(path: String, wal_dir: Option<String>) -> PyResult<()> {
-    let sock_path = PathBuf::from(&path);
+#[pyfunction(signature = (data_dir, snapshot_interval_secs=60, retention_chunks=3))]
+fn serve_unix(
+    data_dir: String,
+    snapshot_interval_secs: u64,
+    retention_chunks: u64,
+) -> PyResult<()> {
+    let paths = Paths::new(&data_dir)
+        .map_err(|e| PyRuntimeError::new_err(format!("init paths: {}", e)))?;
+    let sock_path = paths.uds_path();
     if sock_path.exists() {
         fs::remove_file(&sock_path)
             .map_err(|e| PyRuntimeError::new_err(format!("Remove old socket: {}", e)))?;
     }
 
-    println!("🚀 TinyCache UDS server: {:?}", sock_path);
+    println!("TinyCache UDS server: {:?}", sock_path);
 
-    // let wal_path = PathBuf::from("tiny-mp-cache.wal");
-    let wal_path = resolve_wal_path(wal_dir, "tiny-mp-cache.wal")?;
     let core = Arc::new(
-        PersistentCore::new(wal_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
+        PersistentCore::new(
+            PathBuf::from(&data_dir),
+            snapshot_interval_secs,
+            retention_chunks,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?,
     );
 
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind UDS error: {}", e)))?;
 
-    println!("🚀 TinyCache UDS ready: {:?}", sock_path);
+    println!("TinyCache UDS ready: {:?}", sock_path);
 
     for stream_res in listener.incoming() {
         match stream_res {
