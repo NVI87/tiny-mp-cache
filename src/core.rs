@@ -40,12 +40,10 @@ impl CacheCore {
         id
     }
 
-    /// Используется при загрузке меты с диска: добавить только KeyMeta, без значения.
     pub fn insert_meta_only(&self, key: String, meta: KeyMeta) {
         self.meta_by_key.insert(key, meta);
     }
 
-    /// Экспорт для записи в keys.bin: (key, key_id, ttl_duration, updated_at)
     pub fn export_meta_for_disk(
         &self,
     ) -> Vec<(String, KeyId, Option<Duration>, Instant)> {
@@ -53,7 +51,6 @@ impl CacheCore {
         for entry in self.meta_by_key.iter() {
             let key = entry.key().clone();
             let key_id = entry.key_id;
-            // ttl в виде Duration от now
             let ttl_dur = entry
                 .ttl
                 .and_then(|t| {
@@ -66,6 +63,30 @@ impl CacheCore {
             res.push((key, key_id, ttl_dur, entry.updated_at));
         }
         res
+    }
+
+    /// Полный dump «живых» ключей для snapshot’а.
+    pub fn export_live_with_values(
+        &self,
+    ) -> Vec<(String, Vec<u8>, Option<Duration>)> {
+        let mut out = Vec::new();
+        let now = Instant::now();
+
+        for entry in self.meta_by_key.iter() {
+            if let Some(ttl) = entry.ttl {
+                if now >= ttl {
+                    continue;
+                }
+            }
+            if let Some(v) = self.values.get(&entry.key_id) {
+                let ttl_dur = entry
+                    .ttl
+                    .and_then(|t| if t > now { Some(t - now) } else { None });
+                out.push((entry.key().clone(), v.clone(), ttl_dur));
+            }
+        }
+
+        out
     }
 
     pub fn get_meta(&self, key: &str) -> Option<KeyMeta> {

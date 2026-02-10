@@ -9,7 +9,7 @@ mod meta;
 use crate::core::CacheCore;
 use crate::error::CacheError;
 use crate::wal::{Wal, WalRecord};
-use crate::meta::{Paths, StateMeta, load_or_init_state, load_keys_meta};
+use crate::meta::{Paths, StateMeta, load_or_init_state, load_keys_meta, save_keys_meta};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bincode;
 #[cfg(unix)]
@@ -34,7 +34,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CacheCommand {
-    /// Set(key, value, ttl_ms). ttl_ms < 0 => нет TTL.
     Set(String, Vec<u8>, i64),
     Get(String),
     Pop(String),
@@ -58,9 +57,9 @@ pub enum CacheResponse {
 
 #[derive(Clone, Debug)]
 enum TransportAddr {
-    Tcp(String),     // "127.0.0.1:5002"
+    Tcp(String),
     #[cfg(unix)]
-    Unix(PathBuf),   // "/tmp/tiny-mp-cache.sock"
+    Unix(PathBuf),
 }
 
 impl TransportAddr {
@@ -89,9 +88,7 @@ impl TransportAddr {
 pub struct PersistentCore {
     core: CacheCore,
     wal: Wal,
-    #[allow(dead_code)]
-    state: StateMeta,
-    #[allow(dead_code)]
+    state: Arc<Mutex<StateMeta>>,
     paths: Paths,
 }
 
@@ -99,31 +96,149 @@ impl PersistentCore {
     pub fn new(
         data_dir: PathBuf,
         snapshot_interval_secs: u64,
-        retention_chunks: u64,
+        retention_snapshots: u64,
     ) -> Result<Self, CacheError> {
-        // Настроить директории
         let paths = Paths::new(&data_dir)?;
-
-        // Загрузить/инициализировать state.json
-        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
-
-        // Создать ядро и загрузить мету ключей
+        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_snapshots)?;
         let core = CacheCore::new();
+
         load_keys_meta(&paths, &core)?;
 
-        // Открыть WAL и доиграть его
         let wal = Wal::open(paths.wal_log())?;
         wal.replay(&core)?;
 
-        Ok(Self {
+        let pc = Self {
             core,
             wal,
-            state,
+            state: Arc::new(Mutex::new(state)),
             paths,
-        })
+        };
+
+        pc.spawn_snapshot_thread();
+
+        Ok(pc)
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<std::time::Duration>) -> Result<(), CacheError> {
+    fn spawn_snapshot_thread(&self) {
+        let core = self.core.clone();
+        let wal = self.wal_path_reset_handle();
+        let state_arc = self.state.clone();
+        let paths = self.paths.clone();
+
+        thread::spawn(move || {
+            loop {
+                let interval;
+                let retention;
+                {
+                    let st = state_arc.lock().unwrap();
+                    interval = st.snapshot_interval_secs;
+                    retention = st.retention_snapshots;
+                }
+
+                if interval == 0 {
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                thread::sleep(Duration::from_secs(interval));
+
+                if let Err(e) =
+                    Self::do_snapshot(&core, &wal, &state_arc, &paths, retention)
+                {
+                    eprintln!("snapshot error: {:?}", e);
+                }
+            }
+        });
+    }
+
+    fn wal_path_reset_handle(&self) -> Wal {
+        Wal::open(self.paths.wal_log()).expect("reopen WAL for snapshot")
+    }
+
+    fn do_snapshot(
+        core: &CacheCore,
+        wal: &Wal,
+        state_arc: &Arc<Mutex<StateMeta>>,
+        paths: &Paths,
+        retention: u64,
+    ) -> Result<(), CacheError> {
+        // 1) выгружаем live‑состояние
+        let live = core.export_live_with_values();
+
+        #[derive(Serialize)]
+        struct SnapshotFile {
+            format_version: u32,
+            entries: Vec<(String, Vec<u8>, i64)>, // (key, value, ttl_ms)
+        }
+
+        let now = Instant::now();
+        let entries: Vec<(String, Vec<u8>, i64)> = live
+            .into_iter()
+            .map(|(k, v, ttl)| {
+                let ttl_ms = ttl
+                    .and_then(|d| {
+                        // ttl уже duration «от сейчас»
+                        if d.as_millis() <= 0 {
+                            None
+                        } else {
+                            Some(d.as_millis() as i64)
+                        }
+                    })
+                    .unwrap_or(-1);
+                (k, v, ttl_ms)
+            })
+            .collect();
+
+        let mut state = state_arc.lock().unwrap();
+        let snapshot_id = now.elapsed().as_millis() as u64 + state.current_snapshot_id + 1;
+        state.current_snapshot_id = snapshot_id;
+        state.snapshots.push(snapshot_id);
+
+        let snap_path = paths.snapshot_file(snapshot_id);
+        let tmp = snap_path.with_extension("tmp");
+
+        let file = SnapshotFile {
+            format_version: StateMeta::CURRENT_VERSION,
+            entries,
+        };
+        let data =
+            bincode::serialize(&file).map_err(|e| CacheError::Serialization(e.to_string()))?;
+
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| CacheError::Internal(format!("create snapshot.tmp: {}", e)))?;
+            f.write_all(&data)
+                .and_then(|_| f.flush())
+                .map_err(|e| CacheError::Internal(format!("write snapshot.tmp: {}", e)))?;
+        }
+        std::fs::rename(&tmp, &snap_path)
+            .map_err(|e| CacheError::Internal(format!("rename snapshot.tmp: {}", e)))?;
+
+        // 2) сохраняем keys.bin
+        save_keys_meta(paths, core)?;
+
+        // 3) retention
+        if retention > 0 && state.snapshots.len() as u64 > retention {
+            let to_remove = state.snapshots.len() as u64 - retention;
+            for _ in 0..to_remove {
+                if let Some(old_id) = state.snapshots.first().cloned() {
+                    let old_path = paths.snapshot_file(old_id);
+                    let _ = std::fs::remove_file(&old_path);
+                    state.snapshots.remove(0);
+                }
+            }
+        }
+
+        // 4) сохраняем state.json
+        crate::meta::save_state(paths, &state)?;
+
+        // 5) обнуляем WAL
+        wal.reset()?;
+
+        Ok(())
+    }
+
+    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), CacheError> {
         let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
         self.wal.append(&WalRecord::Set {
             key: key.clone(),
