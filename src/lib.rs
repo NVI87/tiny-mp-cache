@@ -6,8 +6,8 @@ mod error;
 mod wal;
 
 use crate::core::CacheCore;
-use crate::error::CacheError;
 use crate::wal::{Wal, WalRecord};
+use crate::error::CacheError;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -32,7 +32,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CacheCommand {
-    Set(String, Vec<u8>),
+    /// Set(key, value, ttl_ms). ttl_ms < 0 => нет TTL.
+    Set(String, Vec<u8>, i64),
     Get(String),
     Pop(String),
     Del(String),
@@ -97,10 +98,14 @@ impl PersistentCore {
         Ok(Self { core, wal })
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>) -> Result<(), CacheError> {
-        self.wal
-            .append(&WalRecord::Set(key.clone(), value.clone()))?;
-        self.core.set(key, value);
+    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), CacheError> {
+        let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
+        self.wal.append(&WalRecord::Set {
+            key: key.clone(),
+            value: value.clone(),
+            ttl_ms,
+        })?;
+        self.core.set(key, value, ttl);
         Ok(())
     }
 
@@ -109,12 +114,16 @@ impl PersistentCore {
     }
 
     pub fn pop(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        self.wal.append(&WalRecord::Pop(key.to_string()))?;
+        self.wal.append(&WalRecord::Pop {
+            key: key.to_string(),
+        })?;
         Ok(self.core.pop(key))
     }
 
     pub fn delete(&self, key: &str) -> Result<i64, CacheError> {
-        self.wal.append(&WalRecord::Del(key.to_string()))?;
+        self.wal.append(&WalRecord::Del {
+            key: key.to_string(),
+        })?;
         Ok(self.core.delete(key))
     }
 
@@ -225,8 +234,13 @@ fn handle_connection_impl<S: Read + Write>(
         bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
     let resp = match cmd {
-        CacheCommand::Set(key, value) => {
-            core.set(key, value)?;
+        CacheCommand::Set(key, value, ttl_ms) => {
+            let ttl = if ttl_ms < 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ttl_ms as u64))
+            };
+            core.set(key, value, ttl)?;
             CacheResponse::Ok
         }
         CacheCommand::Get(key) => core
@@ -402,9 +416,13 @@ impl TinyCache {
         Self { addr }
     }
 
-    fn set(&self, key: String, value: &[u8]) -> PyResult<()> {
+    /// set(key, value, ttl_ms=None)
+    ///
+    /// ttl_ms: int | None
+    fn set(&self, key: String, value: &[u8], ttl_ms: Option<i64>) -> PyResult<()> {
         let v = value.to_vec();
-        match send_cmd_sync(&self.addr, CacheCommand::Set(key, v)) {
+        let ttl_field = ttl_ms.unwrap_or(-1);
+        match send_cmd_sync(&self.addr, CacheCommand::Set(key, v, ttl_field)) {
             Ok(CacheResponse::Ok) => Ok(()),
             Ok(resp) => Err(PyRuntimeError::new_err(format!(
                 "Unexpected response from set: {:?}",
