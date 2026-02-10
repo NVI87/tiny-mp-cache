@@ -2,24 +2,19 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Внутренний ID ключа (можно заменить на что-то своё позже)
 pub type KeyId = u64;
 
-/// Метаданные по ключу
 #[derive(Clone, Debug)]
 pub struct KeyMeta {
     pub key_id: KeyId,
-    pub ttl: Option<Instant>,    // момент истечения, None = бессрочно
+    pub ttl: Option<Instant>,
     pub updated_at: Instant,
 }
 
 #[derive(Clone)]
 pub struct CacheCore {
-    /// Ключ → мета (id, ttl, updated_at)
-    meta_by_key: Arc<DashMap<String, KeyMeta>>,
-    /// key_id → value
-    values: Arc<DashMap<KeyId, Vec<u8>>>,
-    /// простой счётчик для генерации новых key_id
+    pub(crate) meta_by_key: Arc<DashMap<String, KeyMeta>>,
+    pub(crate) values: Arc<DashMap<KeyId, Vec<u8>>>,
     next_key_id: Arc<parking_lot::Mutex<KeyId>>,
 }
 
@@ -45,12 +40,38 @@ impl CacheCore {
         id
     }
 
-    /// Получить (key_id, мету) по cache_key, если ключ существует и не протух по TTL.
+    /// Используется при загрузке меты с диска: добавить только KeyMeta, без значения.
+    pub fn insert_meta_only(&self, key: String, meta: KeyMeta) {
+        self.meta_by_key.insert(key, meta);
+    }
+
+    /// Экспорт для записи в keys.bin: (key, key_id, ttl_duration, updated_at)
+    pub fn export_meta_for_disk(
+        &self,
+    ) -> Vec<(String, KeyId, Option<Duration>, Instant)> {
+        let mut res = Vec::new();
+        for entry in self.meta_by_key.iter() {
+            let key = entry.key().clone();
+            let key_id = entry.key_id;
+            // ttl в виде Duration от now
+            let ttl_dur = entry
+                .ttl
+                .and_then(|t| {
+                    if t > Instant::now() {
+                        Some(t - Instant::now())
+                    } else {
+                        None
+                    }
+                });
+            res.push((key, key_id, ttl_dur, entry.updated_at));
+        }
+        res
+    }
+
     pub fn get_meta(&self, key: &str) -> Option<KeyMeta> {
         let mut entry = self.meta_by_key.get_mut(key)?;
         if let Some(ttl) = entry.ttl {
             if Instant::now() >= ttl {
-                // TTL истёк — удаляем
                 let key_id = entry.key_id;
                 drop(entry);
                 self.meta_by_key.remove(key);
@@ -61,13 +82,11 @@ impl CacheCore {
         Some(entry.clone())
     }
 
-    /// Низкоуровневый GET по cache_key.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let meta = self.get_meta(key)?;
         self.values.get(&meta.key_id).map(|v| v.clone())
     }
 
-    /// Установить значение с возможным TTL (None = нет TTL).
     pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) {
         let now = Instant::now();
         let expires_at = ttl.map(|d| now + d);
@@ -88,11 +107,8 @@ impl CacheCore {
         self.values.insert(key_id, value);
     }
 
-    /// Попытаться вынуть и удалить ключ.
     pub fn pop(&self, key: &str) -> Option<Vec<u8>> {
-        // Проверяем TTL
         if let Some(meta) = self.get_meta(key) {
-            // ещё жив
             self.meta_by_key.remove(key);
             self.values.remove(&meta.key_id).map(|(_, v)| v)
         } else {
@@ -100,7 +116,6 @@ impl CacheCore {
         }
     }
 
-    /// Удалить ключ, вернуть 1 если был, 0 если нет.
     pub fn delete(&self, key: &str) -> i64 {
         if let Some((_, meta)) = self.meta_by_key.remove(key) {
             self.values.remove(&meta.key_id);
@@ -110,7 +125,6 @@ impl CacheCore {
         }
     }
 
-    /// Список ключей, удовлетворяющих префиксу, с фильтрацией по TTL.
     pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
         let now = Instant::now();
         let mut res = Vec::new();
@@ -119,10 +133,8 @@ impl CacheCore {
             if !entry.key().starts_with(prefix) {
                 continue;
             }
-            // TTL-фильтрация
             if let Some(ttl) = entry.ttl {
                 if now >= ttl {
-                    // протух — чистим, не возвращаем
                     let key = entry.key().clone();
                     let key_id = entry.key_id;
                     drop(entry);
@@ -137,9 +149,7 @@ impl CacheCore {
         res
     }
 
-    /// Кол-во живых ключей (с учётом TTL)
     pub fn len(&self) -> i64 {
-        // Ленивая чистка TTL перед подсчётом
         let now = Instant::now();
         let mut to_delete = Vec::new();
         for entry in self.meta_by_key.iter() {
