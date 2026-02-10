@@ -1,4 +1,4 @@
-use crate::core::{CacheCore, KeyMeta};
+use crate::core::{CacheCore, KeyMeta, ChunkId};
 use crate::error::CacheError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StateMeta {
     pub format_version: u32,
-    pub current_snapshot_id: u64,
-    pub snapshots: Vec<u64>,          // список snapshot_id по возрастанию
-    pub snapshot_interval_secs: u64,  // n
-    pub retention_snapshots: u64,     // m
+    pub current_chunk_id: ChunkId,
+    pub live_chunks: Vec<ChunkId>,      // последние m по новизне
+    pub snapshot_interval_secs: u64,    // n
+    pub retention_chunks: u64,          // m
 }
 
 impl StateMeta {
@@ -23,6 +23,7 @@ impl StateMeta {
 struct KeyMetaDisk {
     key: String,
     key_id: u64,
+    chunk_id: u64,
     ttl_ms: i64,
     updated_at_ms: i64,
 }
@@ -36,7 +37,6 @@ fn now_unix_ms() -> i64 {
 
 #[derive(Clone, Debug)]
 pub struct Paths {
-    pub data_dir: PathBuf,
     pub meta_dir: PathBuf,
     pub wal_dir: PathBuf,
     pub chunks_dir: PathBuf,
@@ -61,7 +61,6 @@ impl Paths {
             .map_err(|e| CacheError::Internal(format!("create ipc dir: {}", e)))?;
 
         Ok(Self {
-            data_dir: dd,
             meta_dir,
             wal_dir,
             chunks_dir,
@@ -81,8 +80,8 @@ impl Paths {
         self.wal_dir.join("log.bin")
     }
 
-    pub fn snapshot_file(&self, id: u64) -> PathBuf {
-        self.chunks_dir.join(format!("snapshot-{}.bin", id))
+    pub fn chunk_file(&self, id: ChunkId) -> PathBuf {
+        self.chunks_dir.join(format!("chunk_{}.bin", id))
     }
 
     #[cfg(unix)]
@@ -94,7 +93,7 @@ impl Paths {
 pub fn load_or_init_state(
     paths: &Paths,
     snapshot_interval_secs: u64,
-    retention_snapshots: u64,
+    retention_chunks: u64,
 ) -> Result<StateMeta, CacheError> {
     let state_path = paths.state_json();
     if state_path.exists() {
@@ -106,16 +105,16 @@ pub fn load_or_init_state(
         let mut state: StateMeta =
             serde_json::from_slice(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
         state.snapshot_interval_secs = snapshot_interval_secs;
-        state.retention_snapshots = retention_snapshots;
+        state.retention_chunks = retention_chunks;
         Ok(state)
     } else {
         let now = now_unix_ms() as u64;
         let state = StateMeta {
             format_version: StateMeta::CURRENT_VERSION,
-            current_snapshot_id: now,
-            snapshots: Vec::new(),
+            current_chunk_id: now,
+            live_chunks: Vec::new(),
             snapshot_interval_secs,
-            retention_snapshots,
+            retention_chunks,
         };
         save_state(paths, &state)?;
         Ok(state)
@@ -125,7 +124,6 @@ pub fn load_or_init_state(
 pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
     let state_path = paths.state_json();
     let tmp = state_path.with_extension("tmp");
-
     let data =
         serde_json::to_vec_pretty(state).map_err(|e| CacheError::Serialization(e.to_string()))?;
     {
@@ -140,7 +138,7 @@ pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Загрузить мету ключей из keys.bin (опционально, как быстрый хинт).
+/// Загрузить полную мету из keys.bin.
 pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     if !keys_path.exists() {
@@ -169,16 +167,17 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
         )));
     }
 
+    let now = std::time::Instant::now();
     for e in file.entries {
         let ttl = if e.ttl_ms < 0 {
             None
         } else {
             Some(Duration::from_millis(e.ttl_ms as u64))
         };
-        let now = std::time::Instant::now();
         let ttl_instant = ttl.map(|d| now + d);
         let meta = KeyMeta {
             key_id: e.key_id,
+            chunk_id: e.chunk_id,
             ttl: ttl_instant,
             updated_at: now,
         };
@@ -188,7 +187,7 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
     Ok(())
 }
 
-pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
+pub fn save_keys_meta(paths: &Paths, core: &CacheCore, state: &StateMeta) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     let tmp = keys_path.with_extension("tmp");
 
@@ -205,6 +204,7 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
         .map(|(key, key_id, ttl, _updated_at)| KeyMetaDisk {
             key,
             key_id,
+            chunk_id: state.current_chunk_id,
             ttl_ms: ttl.map(|d| d.as_millis() as i64).unwrap_or(-1),
             updated_at_ms: now_ms,
         })
@@ -230,55 +230,3 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
     Ok(())
 }
 
-/// Полноценное восстановление: последний snapshot + WAL.
-pub fn load_latest_snapshot_into_core(
-    paths: &Paths,
-    state: &StateMeta,
-    core: &CacheCore,
-) -> Result<(), CacheError> {
-    if state.snapshots.is_empty() {
-        return Ok(());
-    }
-    let last_id = *state
-        .snapshots
-        .last()
-        .expect("snapshots non-empty but .last() failed");
-    let snap_path = paths.snapshot_file(last_id);
-    if !snap_path.exists() {
-        // состояние разрушено/почищено — ничего не делаем
-        return Ok(());
-    }
-
-    let mut f = File::open(&snap_path)
-        .map_err(|e| CacheError::Internal(format!("open snapshot: {}", e)))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .map_err(|e| CacheError::Internal(format!("read snapshot: {}", e)))?;
-
-    #[derive(Deserialize)]
-    struct SnapshotFile {
-        format_version: u32,
-        entries: Vec<(String, Vec<u8>, i64)>, // (key, value, ttl_ms)
-    }
-
-    let file: SnapshotFile =
-        bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
-
-    if file.format_version != StateMeta::CURRENT_VERSION {
-        return Err(CacheError::Internal(format!(
-            "unsupported snapshot version: {}",
-            file.format_version
-        )));
-    }
-
-    for (key, value, ttl_ms) in file.entries {
-        let ttl = if ttl_ms < 0 {
-            None
-        } else {
-            Some(Duration::from_millis(ttl_ms as u64))
-        };
-        core.set(key, value, ttl);
-    }
-
-    Ok(())
-}
