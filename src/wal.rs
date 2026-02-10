@@ -2,27 +2,16 @@ use crate::core::CacheCore;
 use crate::error::CacheError;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum WalRecord {
-    /// SET key, value, ttl_ms (-1 = None)
-    Set {
-        key: String,
-        value: Vec<u8>,
-        ttl_ms: i64,
-    },
-    /// DEL key
-    Del {
-        key: String,
-    },
-    /// POP key
-    Pop {
-        key: String,
-    },
+    Set { key: String, value: Vec<u8>, ttl_ms: i64 },
+    Del { key: String },
+    Pop { key: String },
 }
 
 pub struct Wal {
@@ -38,7 +27,6 @@ impl Wal {
             .read(true)
             .open(&path)
             .map_err(|e| CacheError::Internal(format!("open WAL: {}", e)))?;
-
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -101,6 +89,18 @@ impl Wal {
             }
         }
 
+        Ok(())
+    }
+
+    /// Обнулить WAL после snapshot’а.
+    pub fn reset(&self) -> Result<(), CacheError> {
+        let mut f = self
+            .file
+            .lock()
+            .map_err(|_| CacheError::Internal("WAL mutex poisoned".into()))?;
+        f.set_len(0)
+            .and_then(|_| f.seek(SeekFrom::Start(0)))
+            .map_err(|e| CacheError::Internal(format!("truncate WAL: {}", e)))?;
         Ok(())
     }
 }

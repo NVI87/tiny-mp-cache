@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StateMeta {
     pub format_version: u32,
-    pub current_chunk_id: u64,
-    pub live_chunks: Vec<u64>,
-    pub snapshot_interval_secs: u64,
-    pub retention_chunks: u64,
+    pub current_snapshot_id: u64,
+    pub snapshots: Vec<u64>,          // список snapshot_id по возрастанию
+    pub snapshot_interval_secs: u64,  // n
+    pub retention_snapshots: u64,     // m
 }
 
 impl StateMeta {
@@ -23,8 +23,8 @@ impl StateMeta {
 struct KeyMetaDisk {
     key: String,
     key_id: u64,
-    ttl_ms: i64,        // -1 = None
-    updated_at_ms: i64, // unix ms
+    ttl_ms: i64,
+    updated_at_ms: i64,
 }
 
 fn now_unix_ms() -> i64 {
@@ -34,7 +34,6 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Структура, инкапсулирующая все пути внутри data_dir
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub data_dir: PathBuf,
@@ -82,17 +81,20 @@ impl Paths {
         self.wal_dir.join("log.bin")
     }
 
+    pub fn snapshot_file(&self, id: u64) -> PathBuf {
+        self.chunks_dir.join(format!("snapshot-{}.bin", id))
+    }
+
     #[cfg(unix)]
     pub fn uds_path(&self) -> PathBuf {
         self.ipc_dir.join("tiny-cache.sock")
     }
 }
 
-/// Загрузить state.json, либо создать дефолтный, если нет.
 pub fn load_or_init_state(
     paths: &Paths,
     snapshot_interval_secs: u64,
-    retention_chunks: u64,
+    retention_snapshots: u64,
 ) -> Result<StateMeta, CacheError> {
     let state_path = paths.state_json();
     if state_path.exists() {
@@ -103,18 +105,17 @@ pub fn load_or_init_state(
             .map_err(|e| CacheError::Internal(format!("read state.json: {}", e)))?;
         let mut state: StateMeta =
             serde_json::from_slice(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
-        // Обновим параметры, если они заданы извне по‑новому
         state.snapshot_interval_secs = snapshot_interval_secs;
-        state.retention_chunks = retention_chunks;
+        state.retention_snapshots = retention_snapshots;
         Ok(state)
     } else {
-        // первый запуск
+        let now = now_unix_ms() as u64;
         let state = StateMeta {
             format_version: StateMeta::CURRENT_VERSION,
-            current_chunk_id: now_unix_ms() as u64,
-            live_chunks: Vec::new(),
+            current_snapshot_id: now,
+            snapshots: Vec::new(),
             snapshot_interval_secs,
-            retention_chunks,
+            retention_snapshots,
         };
         save_state(paths, &state)?;
         Ok(state)
@@ -139,11 +140,9 @@ pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Загрузить мету ключей из keys.bin в CacheCore
 pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     if !keys_path.exists() {
-        // первый старт, нечего грузить
         return Ok(());
     }
 
@@ -169,16 +168,12 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
         )));
     }
 
-    // Восстанавливаем только мету, значения подтянутся из чанков/WAL по GET
     for e in file.entries {
         let ttl = if e.ttl_ms < 0 {
             None
         } else {
             Some(Duration::from_millis(e.ttl_ms as u64))
         };
-        let updated_at = UNIX_EPOCH + Duration::from_millis(e.updated_at_ms as u64);
-        // В core у нас KeyMeta с Instant, поэтому для первого приближения
-        // пересчитаем относительно now:
         let now = std::time::Instant::now();
         let ttl_instant = ttl.map(|d| now + d);
         let meta = KeyMeta {
@@ -192,7 +187,6 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
     Ok(())
 }
 
-/// Сохранить мету ключей в keys.bin
 pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     let tmp = keys_path.with_extension("tmp");
