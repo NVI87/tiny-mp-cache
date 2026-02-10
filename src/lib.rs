@@ -6,12 +6,11 @@ mod error;
 mod wal;
 mod meta;
 
-use crate::core::CacheCore;
+use crate::core::{CacheCore, ChunkId};
 use crate::error::CacheError;
 use crate::wal::{Wal, WalRecord};
 use crate::meta::{
-    Paths, StateMeta, load_or_init_state, load_keys_meta, save_keys_meta,
-    load_latest_snapshot_into_core,
+    Paths, StateMeta, load_or_init_state, save_state, load_keys_meta, save_keys_meta,
 };
 
 use pyo3::exceptions::PyRuntimeError;
@@ -23,7 +22,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bincode;
 #[cfg(unix)]
@@ -37,6 +36,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CacheCommand {
+    /// Set(key, value, ttl_ms) — ttl_ms < 0 => без TTL
     Set(String, Vec<u8>, i64),
     Get(String),
     Pop(String),
@@ -85,7 +85,7 @@ impl TransportAddr {
 }
 
 /// =======================
-/// PersistentCore: CacheCore + WAL
+/// PersistentCore: CacheCore + WAL + meta/state
 /// =======================
 
 pub struct PersistentCore {
@@ -99,21 +99,26 @@ impl PersistentCore {
     pub fn new(
         data_dir: PathBuf,
         snapshot_interval_secs: u64,
-        retention_snapshots: u64,
+        retention_chunks: u64,
     ) -> Result<Self, CacheError> {
         let paths = Paths::new(&data_dir)?;
-        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_snapshots)?;
+        let mut state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
         let core = CacheCore::new();
 
-        // 1) восстановление из последнего snapshot
-        load_latest_snapshot_into_core(&paths, &state, &core)?;
+        // 1) Загрузка меты из keys.bin
+        load_keys_meta(&paths, &core)?;
 
-        // 2) опционально доинициализируем мету из keys.bin (можно вообще выкинуть)
-        let _ = load_keys_meta(&paths, &core);
+        // 2) GC по retention (чистим по chunk_id и TTL)
+        core.gc(&state.live_chunks);
 
-        // 3) WAL поверх снапшота
+        // 3) WAL поверх меты (фиксируем незаписанный "текущий" чанк)
         let wal = Wal::open(paths.wal_log())?;
-        wal.replay(&core)?;
+        wal.replay(&core, state.current_chunk_id)?;
+
+        // гарантируем, что current_chunk_id в списке живых
+        if !state.live_chunks.contains(&state.current_chunk_id) {
+            state.live_chunks.push(state.current_chunk_id);
+        }
 
         let pc = Self {
             core,
@@ -129,32 +134,26 @@ impl PersistentCore {
 
     fn spawn_snapshot_thread(&self) {
         let core = self.core.clone();
-        let wal = self.wal_path_reset_handle();
+        let wal_for_reset = self.wal_path_reset_handle();
         let state_arc = self.state.clone();
         let paths = self.paths.clone();
 
-        thread::spawn(move || {
-            loop {
-                let interval;
-                let retention;
-                {
-                    let st = state_arc.lock().unwrap();
-                    interval = st.snapshot_interval_secs;
-                    retention = st.retention_snapshots;
-                }
+        thread::spawn(move || loop {
+            let (interval, retention) = {
+                let st = state_arc.lock().unwrap();
+                (st.snapshot_interval_secs, st.retention_chunks)
+            };
 
-                if interval == 0 {
-                    thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
+            if interval == 0 {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
 
-                thread::sleep(Duration::from_secs(interval));
+            thread::sleep(Duration::from_secs(interval));
 
-                if let Err(e) =
-                    Self::do_snapshot(&core, &wal, &state_arc, &paths, retention)
-                {
-                    eprintln!("snapshot error: {:?}", e);
-                }
+            if let Err(e) = Self::do_snapshot(&core, &wal_for_reset, &state_arc, &paths, retention)
+            {
+                eprintln!("snapshot error: {:?}", e);
             }
         });
     }
@@ -163,6 +162,13 @@ impl PersistentCore {
         Wal::open(self.paths.wal_log()).expect("reopen WAL for snapshot")
     }
 
+    /// STW snapshot+retention:
+    /// - удаление старых чанков (по m)
+    /// - GC по TTL и не‑живым chunk_id
+    /// - запись chunk_{current_chunk_id}.bin
+    /// - дамп keys.bin и state.json
+    /// - reset WAL
+    /// - генерация нового current_chunk_id
     fn do_snapshot(
         core: &CacheCore,
         wal: &Wal,
@@ -170,83 +176,118 @@ impl PersistentCore {
         paths: &Paths,
         retention: u64,
     ) -> Result<(), CacheError> {
-        let live = core.export_live_with_values();
-
-        #[derive(Serialize)]
-        struct SnapshotFile {
-            format_version: u32,
-            entries: Vec<(String, Vec<u8>, i64)>,
-        }
-
-        let entries: Vec<(String, Vec<u8>, i64)> = live
-            .into_iter()
-            .map(|(k, v, ttl)| {
-                let ttl_ms = ttl
-                    .and_then(|d| {
-                        if d.as_millis() <= 0 {
-                            None
-                        } else {
-                            Some(d.as_millis() as i64)
-                        }
-                    })
-                    .unwrap_or(-1);
-                (k, v, ttl_ms)
-            })
-            .collect();
-
+        // STW begin: mutex на state + core.gc через live_chunks
         let mut state = state_arc.lock().unwrap();
-        let snapshot_id = state.current_snapshot_id + 1;
-        state.current_snapshot_id = snapshot_id;
-        state.snapshots.push(snapshot_id);
 
-        let snap_path = paths.snapshot_file(snapshot_id);
-        let tmp = snap_path.with_extension("tmp");
-
-        let file = SnapshotFile {
-            format_version: StateMeta::CURRENT_VERSION,
-            entries,
-        };
-        let data =
-            bincode::serialize(&file).map_err(|e| CacheError::Serialization(e.to_string()))?;
-
-        {
-            let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| CacheError::Internal(format!("create snapshot.tmp: {}", e)))?;
-            f.write_all(&data)
-                .and_then(|_| f.flush())
-                .map_err(|e| CacheError::Internal(format!("write snapshot.tmp: {}", e)))?;
-        }
-        std::fs::rename(&tmp, &snap_path)
-            .map_err(|e| CacheError::Internal(format!("rename snapshot.tmp: {}", e)))?;
-
-        save_keys_meta(paths, core)?;
-
-        if retention > 0 && state.snapshots.len() as u64 > retention {
-            let to_remove = state.snapshots.len() as u64 - retention;
+        // 1) ограничиваем список живых чанков последними m
+        if retention > 0 && state.live_chunks.len() as u64 > retention {
+            let to_remove = state.live_chunks.len() as u64 - retention;
             for _ in 0..to_remove {
-                if let Some(old_id) = state.snapshots.first().cloned() {
-                    let old_path = paths.snapshot_file(old_id);
+                if let Some(old) = state.live_chunks.first().cloned() {
+                    let old_path = paths.chunk_file(old);
                     let _ = std::fs::remove_file(&old_path);
-                    state.snapshots.remove(0);
+                    state.live_chunks.remove(0);
                 }
             }
         }
 
-        crate::meta::save_state(paths, &state)?;
+        // 2) GC по TTL + по chunk_id ∉ live_chunks
+        core.gc(&state.live_chunks);
 
+        // 3) флашим текущий чанк (live мета с chunk_id == current_chunk_id и значениями)
+        let current_chunk_id: ChunkId = state.current_chunk_id;
+        let live_for_chunk = core.export_live_for_chunk(current_chunk_id);
+
+        #[derive(Serialize)]
+        struct ChunkHeader {
+            magic: [u8; 4],
+            version: u32,
+            chunk_id: ChunkId,
+            entry_count: u64,
+        }
+
+        let chunk_path = paths.chunk_file(current_chunk_id);
+        let tmp = chunk_path.with_extension("tmp");
+
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| CacheError::Internal(format!("create chunk tmp: {}", e)))?;
+
+            let header = ChunkHeader {
+                magic: *b"TMCK",
+                version: StateMeta::CURRENT_VERSION,
+                chunk_id: current_chunk_id,
+                entry_count: live_for_chunk.len() as u64,
+            };
+            let header_bytes =
+                bincode::serialize(&header).map_err(|e| CacheError::Serialization(e.to_string()))?;
+            f.write_all(&header_bytes)
+                .and_then(|_| f.flush())
+                .map_err(|e| CacheError::Internal(format!("write chunk header: {}", e)))?;
+
+            for (key_id, value, _ttl) in live_for_chunk {
+                let key_id_bytes = key_id.to_le_bytes();
+                let val_len = value.len() as u32;
+                let val_len_bytes = val_len.to_le_bytes();
+
+                f.write_all(&key_id_bytes)
+                    .and_then(|_| f.write_all(&val_len_bytes))
+                    .and_then(|_| f.write_all(&value))
+                    .map_err(|e| CacheError::Internal(format!("write chunk entry: {}", e)))?;
+            }
+
+            f.flush()
+                .map_err(|e| CacheError::Internal(format!("flush chunk: {}", e)))?;
+        }
+
+        std::fs::rename(&tmp, &chunk_path)
+            .map_err(|e| CacheError::Internal(format!("rename chunk tmp: {}", e)))?;
+
+        if !state.live_chunks.contains(&current_chunk_id) {
+            state.live_chunks.push(current_chunk_id);
+        }
+
+        // 4) дамп меты keys.bin
+        save_keys_meta(paths, &core, &state)?;
+
+        // 5) обновляем state.json (current_chunk_id ещё старый до смены)
+        save_state(paths, &state)?;
+
+        // 6) обнуление WAL
         wal.reset()?;
 
+        // 7) new current_chunk_id
+        let new_id = current_chunk_id.wrapping_add(1);
+        state.current_chunk_id = new_id;
+        if !state.live_chunks.contains(&new_id) {
+            state.live_chunks.push(new_id);
+        }
+        save_state(paths, &state)?;
+
+        // STW end (mutex освобождён при выходе)
         Ok(())
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), CacheError> {
+    pub fn set(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
         let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
+
+        let current_chunk_id = {
+            let st = self.state.lock().unwrap();
+            st.current_chunk_id
+        };
+
         self.wal.append(&WalRecord::Set {
             key: key.clone(),
             value: value.clone(),
             ttl_ms,
+            chunk_id: current_chunk_id,
         })?;
-        self.core.set(key, value, ttl);
+        self.core.set(key, value, ttl, current_chunk_id);
         Ok(())
     }
 
@@ -314,8 +355,8 @@ fn send_cmd_sync(addr: &TransportAddr, cmd: CacheCommand) -> Result<CacheRespons
         }
         #[cfg(unix)]
         TransportAddr::Unix(path) => {
-            let s = UnixStream::connect(path)
-                .map_err(|e| CacheError::Network(e.to_string()))?;
+            let s =
+                UnixStream::connect(path).map_err(|e| CacheError::Network(e.to_string()))?;
             Conn::Unix(s)
         }
     };
@@ -413,10 +454,7 @@ fn handle_connection_impl<S: Read + Write>(
     Ok(())
 }
 
-fn handle_connection(
-    stream: &mut TcpStream,
-    core: Arc<PersistentCore>,
-) -> Result<(), CacheError> {
+fn handle_connection(stream: &mut TcpStream, core: Arc<PersistentCore>) -> Result<(), CacheError> {
     handle_connection_impl(stream, core)
 }
 
@@ -439,6 +477,7 @@ fn serve(
     snapshot_interval_secs: u64,
     retention_chunks: u64,
 ) -> PyResult<()> {
+    println!("*** NEW SERVE VERSION ***");
     let addr = format!("127.0.0.1:{}", port);
     println!("TinyCache TCP server: {}", addr);
 
@@ -487,8 +526,8 @@ fn serve_unix(
     snapshot_interval_secs: u64,
     retention_chunks: u64,
 ) -> PyResult<()> {
-    let paths = Paths::new(&data_dir)
-        .map_err(|e| PyRuntimeError::new_err(format!("init paths: {}", e)))?;
+    let paths =
+        Paths::new(&data_dir).map_err(|e| PyRuntimeError::new_err(format!("init paths: {}", e)))?;
     let sock_path = paths.uds_path();
     if sock_path.exists() {
         fs::remove_file(&sock_path)
@@ -545,17 +584,26 @@ pub struct TinyCache {
 impl TinyCache {
     #[new]
     fn new(addr: String) -> Self {
+        // маленькая задержка, чтобы сервер успел подняться
         thread::sleep(Duration::from_millis(10));
         let addr = TransportAddr::parse(&addr);
         Self { addr }
     }
 
-    /// set(key, value, ttl_ms=None)
-    ///
-    /// ttl_ms: int | None
-    fn set(&self, key: String, value: &[u8], ttl_ms: Option<i64>) -> PyResult<()> {
+    /// set(key: str, value: bytes, ttl: Optional[float] = None) -> None
+    /// ttl в секундах (дробное), None = без TTL.
+    #[pyo3(signature = (key, value, ttl=None))]
+    fn set(&self, key: String, value: &[u8], ttl: Option<f64>) -> PyResult<()> {
         let v = value.to_vec();
-        let ttl_field = ttl_ms.unwrap_or(-1);
+        let ttl_ms_opt: Option<i64> = ttl.map(|sec| {
+            if sec <= 0.0 {
+                -1
+            } else {
+                (sec * 1000.0) as i64
+            }
+        });
+
+        let ttl_field = ttl_ms_opt.unwrap_or(-1);
         match send_cmd_sync(&self.addr, CacheCommand::Set(key, v, ttl_field)) {
             Ok(CacheResponse::Ok) => Ok(()),
             Ok(resp) => Err(PyRuntimeError::new_err(format!(
