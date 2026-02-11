@@ -7,7 +7,7 @@ import time
 from tiny_mp_cache.tiny_mp_cache import serve, serve_unix, TinyCache  # serve_unix доступен только на Unix
 
 
-TCP_PORT = 5002
+TCP_PORT = 5010
 TCP_ADDR = f"tcp://127.0.0.1:{TCP_PORT}"
 
 UDS_ADDR_TEMPLATE = "unix://{sock}"  # форматируем позже
@@ -63,6 +63,8 @@ def run_api_tests(addr: str):
     print(f"== [{addr}] set/get ==")
     c.set("test:a", b"value-a")
     c.set("test:b", b"value-b")
+    print(c.get("test:a"))
+    print(c.get("test:b"))
     assert c.get("test:a") == b"value-a"
     assert c.get("test:b") == b"value-b"
     assert c.get("test:missing") is None

@@ -71,6 +71,15 @@ impl PersistentCore {
         retention_chunks: u64,
     ) -> Result<Arc<Self>, CacheError> {
         let paths = Paths::new(&data_dir)?;
+
+        // Дополнительная гарантия существования директорий перед загрузкой state
+        fs::create_dir_all(&paths.meta_dir)
+            .map_err(|e| CacheError::Internal(format!("ensure meta dir: {}", e)))?;
+        fs::create_dir_all(&paths.wal_dir)
+            .map_err(|e| CacheError::Internal(format!("ensure wal dir: {}", e)))?;
+        fs::create_dir_all(&paths.chunks_dir)
+            .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
+
         let state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
         let core = CacheCore::new();
 
@@ -140,6 +149,13 @@ impl PersistentCore {
         let live = self.core.export_live_for_chunk(current_chunk_id);
         if !live.is_empty() {
             let chunk_path = self.paths.chunk_file(current_chunk_id);
+
+            // Гарантируем существование директории chunks
+            if let Some(parent) = chunk_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
+            }
+
             let tmp = chunk_path.with_extension("tmp");
             {
                 let mut f = fs::File::create(&tmp)

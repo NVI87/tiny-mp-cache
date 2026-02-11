@@ -14,7 +14,7 @@ ADDR = f"tcp://127.0.0.1:{PORT}"
 
 def server(data_dir: str):
     # маленький, но не нулевой интервал, чтобы снапшот успевал сохраняться
-    serve(data_dir, PORT, snapshot_interval_secs=2, retention_chunks=3)
+    serve(data_dir, PORT, snapshot_interval_secs=10, retention_chunks=3)
 
 
 def start_server(data_dir: str) -> mp.Process:
@@ -57,6 +57,10 @@ def main():
         c2 = TinyCache(ADDR)
 
         try:
+            print(f'c2.get("p:keep"): {c2.get("p:keep")}')
+            print(f'c2.get("p:delete"): {c2.get("p:delete")}')
+            print(f'c2.get("p:pop"): {c2.get("p:pop")}')
+
             assert c2.get("p:keep") == b"v1"
             assert c2.get("p:delete") is None
             assert c2.get("p:pop") is None
