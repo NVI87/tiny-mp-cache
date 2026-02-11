@@ -6,6 +6,7 @@ use crate::meta::{
 use crate::wal::{Wal, WalRecord};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
@@ -78,7 +79,7 @@ impl PersistentCore {
         retention_chunks: u64,
     ) -> Result<Arc<Self>, CacheError> {
         let paths = Paths::new(&data_dir)?;
-        let mut state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
+        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
         let core = CacheCore::new();
 
         load_keys_meta(&paths, &core)?;
@@ -127,7 +128,6 @@ impl PersistentCore {
             .map_err(|_| CacheError::Internal("state mutex poisoned".into()))?
             .clone();
 
-        // retention по live_chunks
         if !state.live_chunks.is_empty() && state.live_chunks.len() as u64 > state.retention_chunks
         {
             let keep = state.retention_chunks as usize;
@@ -141,10 +141,8 @@ impl PersistentCore {
             }
         }
 
-        // GC по TTL и live_chunks
         self.core.gc(&state.live_chunks);
 
-        // записываем текущий чанк
         let current_chunk_id = state.current_chunk_id;
         let live = self.core.export_live_for_chunk(current_chunk_id);
         if !live.is_empty() {
@@ -154,7 +152,6 @@ impl PersistentCore {
                 let mut f = fs::File::create(&tmp)
                     .map_err(|e| CacheError::Internal(format!("create chunk tmp: {}", e)))?;
 
-                // Header
                 let magic = b"TMCK";
                 let version = 1u32;
                 let count = live.len() as u64;
@@ -188,7 +185,6 @@ impl PersistentCore {
 
         save_keys_meta(&self.paths, &self.core, &state)?;
 
-        // новый chunk_id (монотонный)
         let new_chunk_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -691,7 +687,6 @@ impl TinyCache {
     }
 }
 
-/// Вспомогательные методы ретраев (вне #[pymethods])
 impl TinyCache {
     fn _reconnect(&self) -> PyResult<()> {
         let new_stream = connect(&self.addr)?;
