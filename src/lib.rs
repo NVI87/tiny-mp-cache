@@ -661,14 +661,34 @@ impl TinyCache {
         self._with_retry_ok(cmd)
     }
 
-    fn get(&self, _py: Python<'_>, key: &str) -> PyResult<Option<Vec<u8>>> {
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let cmd = CacheCommand::Get(key.to_string());
-        self._with_retry_value(cmd)
+        match self._with_retry_value(cmd)? {
+            Some(v) => {
+                let b = PyBytes::new_bound(py, &v);
+                Ok(Some(b))
+            }
+            None => Ok(None),
+        }
     }
 
-    fn pop(&self, _py: Python<'_>, key: &str) -> PyResult<Option<Vec<u8>>> {
+    fn pop<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let cmd = CacheCommand::Pop(key.to_string());
-        self._with_retry_value(cmd)
+        match self._with_retry_value(cmd)? {
+            Some(v) => {
+                let b = PyBytes::new_bound(py, &v);
+                Ok(Some(b))
+            }
+            None => Ok(None),
+        }
     }
 
     fn delete(&self, _py: Python<'_>, key: &str) -> PyResult<i64> {
