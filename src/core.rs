@@ -8,8 +8,8 @@ pub type ChunkId = u64;
 
 #[derive(Clone, Debug)]
 pub struct KeyMeta {
-    pub key_id: KeyId,
-    pub chunk_id: ChunkId,
+    pub keyid: KeyId,
+    pub chunkid: ChunkId,
     pub ttl: Option<Instant>,
     pub updated_at: Instant,
 }
@@ -39,7 +39,7 @@ impl CacheCore {
     fn gen_key_id(&self) -> KeyId {
         let mut guard = self.next_key_id.lock();
         let id = *guard;
-        *guard = id.wrapping_add(1);
+        *guard = guard.wrapping_add(1);
         id
     }
 
@@ -47,184 +47,149 @@ impl CacheCore {
         self.meta_by_key.insert(key, meta);
     }
 
-    /// Экспорт меты для keys.bin: (cache_key, key_id, chunk_id, ttl, updated_at).
-    pub fn export_meta_for_disk(
-        &self,
-    ) -> Vec<(String, KeyId, ChunkId, Option<Duration>, Instant)> {
-        let mut res = Vec::new();
+    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let now = Instant::now();
-        for entry in self.meta_by_key.iter() {
-            let key = entry.key().clone();
-            let key_id = entry.key_id;
-            let chunk_id = entry.chunk_id;
-            let ttl_dur = entry
-                .ttl
-                .and_then(|t| if t > now { Some(t - now) } else { None });
-            res.push((key, key_id, chunk_id, ttl_dur, entry.updated_at));
-        }
-        res
-    }
-
-    /// Дамп «живых» ключей для snapshot’а текущего чанка.
-    pub fn export_live_for_chunk(
-        &self,
-        current_chunk_id: ChunkId,
-    ) -> Vec<(KeyId, Vec<u8>, Option<Duration>)> {
-        let mut out = Vec::new();
-        let now = Instant::now();
-
-        for entry in self.meta_by_key.iter() {
-            if entry.chunk_id != current_chunk_id {
-                continue;
-            }
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    continue;
-                }
-            }
-            if let Some(v) = self.values.get(&entry.key_id) {
-                let ttl_dur = entry
-                    .ttl
-                    .and_then(|t| if t > now { Some(t - now) } else { None });
-                out.push((entry.key_id, v.clone(), ttl_dur));
-            }
-        }
-
-        out
-    }
-
-    /// Жёсткая очистка по TTL и по "неживым" chunk_id.
-    pub fn gc(&self, live_chunks: &[ChunkId]) {
-        let now = Instant::now();
-        let live: HashSet<ChunkId> = live_chunks.iter().cloned().collect();
-        let mut to_delete = Vec::new();
-
-        for entry in self.meta_by_key.iter() {
-            let mut dead = false;
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    dead = true;
-                }
-            }
-            if !dead && !live.is_empty() && !live.contains(&entry.chunk_id) {
-                dead = true;
-            }
-            if dead {
-                to_delete.push((entry.key().clone(), entry.key_id));
-            }
-        }
-
-        for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
-        }
-    }
-
-    /// Берём мету с ленивой очисткой TTL. Без iter_mut на горячем пути.
-    pub fn get_meta(&self, key: &str) -> Option<KeyMeta> {
-        // Сначала просто смотрим.
-        if let Some(entry) = self.meta_by_key.get(key) {
-            if let Some(ttl) = entry.ttl {
-                if Instant::now() >= ttl {
-                    let key_id = entry.key_id;
-                    let key_str = entry.key().clone();
-                    drop(entry);
-                    self.meta_by_key.remove(&key_str);
-                    self.values.remove(&key_id);
+        if let Some(meta) = self.meta_by_key.get(key) {
+            if let Some(ttl) = meta.ttl {
+                if now > ttl {
+                    drop(meta);
+                    self.meta_by_key.remove(key);
                     return None;
                 }
             }
-            return Some(entry.clone());
+            return self.values.get(&meta.keyid).map(|v| v.clone());
         }
         None
     }
 
-    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let meta = self.get_meta(key)?;
-        self.values.get(&meta.key_id).map(|v| v.clone())
-    }
-
-    /// set/update с учётом текущего chunk_id.
-    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>, chunk_id: ChunkId) {
-        let now = Instant::now();
-        let expires_at = ttl.map(|d| now + d);
-
-        let key_id = if let Some(existing) = self.meta_by_key.get(&key) {
-            existing.key_id
-        } else {
-            self.gen_key_id()
-        };
-
-        let meta = KeyMeta {
-            key_id,
-            chunk_id,
-            ttl: expires_at,
-            updated_at: now,
-        };
-
-        self.meta_by_key.insert(key, meta);
-        self.values.insert(key_id, value);
-    }
-
     pub fn pop(&self, key: &str) -> Option<Vec<u8>> {
-        if let Some(meta) = self.get_meta(key) {
-            self.meta_by_key.remove(key);
-            self.values.remove(&meta.key_id).map(|(_, v)| v)
-        } else {
-            None
+        if let Some((_, meta)) = self.meta_by_key.remove(key) {
+            return self.values.remove(&meta.keyid).map(|(_, v)| v);
         }
+        None
     }
 
     pub fn delete(&self, key: &str) -> i64 {
         if let Some((_, meta)) = self.meta_by_key.remove(key) {
-            self.values.remove(&meta.key_id);
+            self.values.remove(&meta.keyid);
             1
         } else {
             0
         }
     }
 
-    pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
+    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>, chunk_id: ChunkId) {
         let now = Instant::now();
-        let mut res = Vec::new();
-        let mut to_delete = Vec::new();
+        let ttl_instant = ttl.map(|d| now + d);
 
-        for entry in self.meta_by_key.iter() {
-            if !entry.key().starts_with(prefix) {
-                continue;
-            }
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    to_delete.push((entry.key().clone(), entry.key_id));
-                    continue;
+        let keyid = if let Some(mut meta) = self.meta_by_key.get_mut(&key) {
+            let id = meta.keyid;
+            meta.chunkid = chunk_id;
+            meta.ttl = ttl_instant;
+            meta.updated_at = now;
+            id
+        } else {
+            let id = self.gen_key_id();
+            let meta = KeyMeta {
+                keyid: id,
+                chunkid: chunk_id,
+                ttl: ttl_instant,
+                updated_at: now,
+            };
+            self.meta_by_key.insert(key, meta);
+            id
+        };
+
+        self.values.insert(keyid, value);
+    }
+
+    pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
+        self.meta_by_key
+            .iter()
+            .filter_map(|kv| {
+                let k = kv.key();
+                if k.starts_with(prefix) {
+                    Some(k.clone())
+                } else {
+                    None
                 }
-            }
-            res.push(entry.key().clone());
-        }
-
-        for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
-        }
-
-        res
+            })
+            .collect()
     }
 
     pub fn len(&self) -> i64 {
-        let now = Instant::now();
-        let mut to_delete = Vec::new();
-        for entry in self.meta_by_key.iter() {
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    to_delete.push((entry.key().clone(), entry.key_id));
-                }
-            }
-        }
-        for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
+        self.meta_by_key.len() as i64
+    }
+
+    pub fn gc(&self, live_chunks: &[ChunkId]) {
+        let mut live_set = HashSet::new();
+        for &cid in live_chunks {
+            live_set.insert(cid);
         }
 
-        self.meta_by_key.len() as i64
+        let mut to_remove_keys = Vec::new();
+        let now = Instant::now();
+
+        for entry in self.meta_by_key.iter() {
+            let meta = entry.value();
+            if let Some(ttl) = meta.ttl {
+                if now > ttl {
+                    to_remove_keys.push(entry.key().clone());
+                    continue;
+                }
+            }
+            if !live_set.contains(&meta.chunkid) {
+                to_remove_keys.push(entry.key().clone());
+            }
+        }
+
+        for k in to_remove_keys {
+            if let Some((_, meta)) = self.meta_by_key.remove(&k) {
+                self.values.remove(&meta.keyid);
+            }
+        }
+    }
+
+    pub fn export_live_for_chunk(&self, chunk_id: ChunkId) -> Vec<(KeyId, Vec<u8>, Option<Duration>)> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+
+        for entry in self.meta_by_key.iter() {
+            let meta = entry.value();
+            if meta.chunkid != chunk_id {
+                continue;
+            }
+            if let Some(ttl) = meta.ttl {
+                if now > ttl {
+                    continue;
+                }
+                if let Some(v) = self.values.get(&meta.keyid) {
+                    let ttl_left = ttl
+                        .checked_duration_since(now)
+                        .unwrap_or(Duration::from_millis(0));
+                    out.push((meta.keyid, v.clone(), Some(ttl_left)));
+                }
+            } else if let Some(v) = self.values.get(&meta.keyid) {
+                out.push((meta.keyid, v.clone(), None));
+            }
+        }
+
+        out
+    }
+
+    pub fn export_meta_for_disk(
+        &self,
+    ) -> Vec<(String, KeyId, ChunkId, Option<Instant>, Instant)> {
+        let mut out = Vec::new();
+        for entry in self.meta_by_key.iter() {
+            let key = entry.key().clone();
+            let meta = entry.value();
+            out.push((key, meta.keyid, meta.chunkid, meta.ttl, meta.updated_at));
+        }
+        out
+    }
+
+    pub fn import_meta(&self, data: &[u8]) -> Result<(), crate::error::CacheError> {
+        crate::meta::load_keys_meta_from_bytes(self, data)
     }
 }
