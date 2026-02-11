@@ -1,9 +1,8 @@
-use crate::core::CacheCore;
+use crate::core::{CacheCore, ChunkId};
 use crate::error::CacheError;
-use crate::core::ChunkId;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -104,7 +103,6 @@ impl Wal {
         Ok(())
     }
 
-    /// Обнулить WAL после snapshot’а.
     pub fn reset(&self) -> Result<(), CacheError> {
         let mut f = self
             .file

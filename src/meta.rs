@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct StateMeta {
     pub format_version: u32,
     pub current_chunk_id: ChunkId,
-    pub live_chunks: Vec<ChunkId>,      // последние m по новизне
-    pub snapshot_interval_secs: u64,    // n
-    pub retention_chunks: u64,          // m
+    pub live_chunks: Vec<ChunkId>,
+    pub snapshot_interval_secs: u64,
+    pub retention_chunks: u64,
 }
 
 impl StateMeta {
@@ -81,7 +81,7 @@ impl Paths {
     }
 
     pub fn chunk_file(&self, id: ChunkId) -> PathBuf {
-        self.chunks_dir.join(format!("chunk_{}.bin", id))
+        self.chunks_dir.join(format!("chunk-{}.bin", id))
     }
 
     #[cfg(unix)]
@@ -104,8 +104,10 @@ pub fn load_or_init_state(
             .map_err(|e| CacheError::Internal(format!("read state.json: {}", e)))?;
         let mut state: StateMeta =
             serde_json::from_slice(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
+
         state.snapshot_interval_secs = snapshot_interval_secs;
         state.retention_chunks = retention_chunks;
+
         Ok(state)
     } else {
         let now = now_unix_ms() as u64;
@@ -122,72 +124,31 @@ pub fn load_or_init_state(
 }
 
 pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
-    let state_path = paths.state_json();
-    let tmp = state_path.with_extension("tmp");
-    let data =
-        serde_json::to_vec_pretty(state).map_err(|e| CacheError::Serialization(e.to_string()))?;
+    let path = paths.state_json();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| CacheError::Internal(format!("create meta dir in save_state: {}", e)))?;
+    }
+    let tmp = path.with_extension("tmp");
+    let data = serde_json::to_vec_pretty(state)
+        .map_err(|e| CacheError::Internal(format!("serialize state: {}", e)))?;
     {
         let mut f = File::create(&tmp)
-            .map_err(|e| CacheError::Internal(format!("create state.tmp: {}", e)))?;
+            .map_err(|e| CacheError::Internal(format!("create state tmp: {}", e)))?;
         f.write_all(&data)
             .and_then(|_| f.flush())
-            .map_err(|e| CacheError::Internal(format!("write state.tmp: {}", e)))?;
+            .map_err(|e| CacheError::Internal(format!("write state tmp: {}", e)))?;
     }
-    fs::rename(&tmp, &state_path)
-        .map_err(|e| CacheError::Internal(format!("rename state.tmp: {}", e)))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| CacheError::Internal(format!("rename state: {}", e)))?;
     Ok(())
 }
 
-/// Загрузить полную мету из keys.bin.
-pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
-    let keys_path = paths.keys_bin();
-    if !keys_path.exists() {
-        return Ok(());
-    }
-
-    let mut f = File::open(&keys_path)
-        .map_err(|e| CacheError::Internal(format!("open keys.bin: {}", e)))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .map_err(|e| CacheError::Internal(format!("read keys.bin: {}", e)))?;
-
-    #[derive(Deserialize)]
-    struct KeysFile {
-        format_version: u32,
-        entries: Vec<KeyMetaDisk>,
-    }
-
-    let file: KeysFile =
-        bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
-
-    if file.format_version != StateMeta::CURRENT_VERSION {
-        return Err(CacheError::Internal(format!(
-            "unsupported keys.bin version: {}",
-            file.format_version
-        )));
-    }
-
-    let now = std::time::Instant::now();
-    for e in file.entries {
-        let ttl = if e.ttl_ms < 0 {
-            None
-        } else {
-            Some(Duration::from_millis(e.ttl_ms as u64))
-        };
-        let ttl_instant = ttl.map(|d| now + d);
-        let meta = KeyMeta {
-            key_id: e.key_id,
-            chunk_id: e.chunk_id,
-            ttl: ttl_instant,
-            updated_at: now,
-        };
-        core.insert_meta_only(e.key, meta);
-    }
-
-    Ok(())
-}
-
-pub fn save_keys_meta(paths: &Paths, core: &CacheCore, _state: &StateMeta) -> Result<(), CacheError> {
+pub fn save_keys_meta(
+    paths: &Paths,
+    core: &CacheCore,
+    state: &StateMeta,
+) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     let tmp = keys_path.with_extension("tmp");
 
@@ -201,17 +162,32 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore, _state: &StateMeta) -> Re
     let entries: Vec<KeyMetaDisk> = core
         .export_meta_for_disk()
         .into_iter()
-        .map(|(key, key_id, chunk_id, ttl, _updated_at)| KeyMetaDisk {
-            key,
-            key_id,
-            chunk_id,
-            ttl_ms: ttl.map(|d| d.as_millis() as i64).unwrap_or(-1),
-            updated_at_ms: now_ms,
+        .map(|(key, key_id, chunk_id, ttl_opt, _updated_at)| {
+            let ttl_ms = match ttl_opt {
+                None => -1,
+                Some(exp) => {
+                    // exp: Instant — время истечения
+                    // now_ms: "текущее" время в ms от UNIX
+                    // мы просто сохраняем оставшийся TTL в ms
+                    let now = std::time::Instant::now();
+                    let dur = exp
+                        .checked_duration_since(now)
+                        .unwrap_or(Duration::from_millis(0));
+                    dur.as_millis() as i64
+                }
+            };
+            KeyMetaDisk {
+                key,
+                key_id,
+                chunk_id,
+                ttl_ms,
+                updated_at_ms: now_ms,
+            }
         })
         .collect();
 
     let file = KeysFile {
-        format_version: StateMeta::CURRENT_VERSION,
+        format_version: state.format_version,
         entries,
     };
 
@@ -220,17 +196,70 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore, _state: &StateMeta) -> Re
 
     if let Some(parent) = keys_path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| CacheError::Internal(format!("create meta dir in save_keys_meta: {}", e)))?;
+            .map_err(|e| {
+                CacheError::Internal(format!("create meta dir in save_keys_meta: {}", e))
+            })?;
     }
 
     {
         let mut f = File::create(&tmp)
-            .map_err(|e| CacheError::Internal(format!("create keys.tmp: {}", e)))?;
+            .map_err(|e| CacheError::Internal(format!("create keys tmp: {}", e)))?;
         f.write_all(&data)
             .and_then(|_| f.flush())
-            .map_err(|e| CacheError::Internal(format!("write keys.tmp: {}", e)))?;
+            .map_err(|e| CacheError::Internal(format!("write keys tmp: {}", e)))?;
     }
+
     fs::rename(&tmp, &keys_path)
-        .map_err(|e| CacheError::Internal(format!("rename keys.tmp: {}", e)))?;
+        .map_err(|e| CacheError::Internal(format!("rename keys: {}", e)))?;
+
+    Ok(())
+}
+
+pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
+    let path = paths.keys_bin();
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut f = File::open(&path)
+        .map_err(|e| CacheError::Internal(format!("open keys.bin: {}", e)))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .map_err(|e| CacheError::Internal(format!("read keys.bin: {}", e)))?;
+    core.import_meta(&buf)?;
+    Ok(())
+}
+
+// Helper used from CacheCore::import_meta
+pub fn load_keys_meta_from_bytes(
+    core: &CacheCore,
+    data: &[u8],
+) -> Result<(), CacheError> {
+    #[derive(Deserialize)]
+    struct KeysFile {
+        format_version: u32,
+        entries: Vec<KeyMetaDisk>,
+    }
+
+    let file: KeysFile =
+        bincode::deserialize(data).map_err(|e| CacheError::Serialization(e.to_string()))?;
+
+    let now = std::time::Instant::now();
+
+    for e in file.entries {
+        let ttl = if e.ttl_ms < 0 {
+            None
+        } else {
+            Some(Duration::from_millis(e.ttl_ms as u64))
+        };
+        let ttl_instant = ttl.map(|d| now + d);
+        let meta = KeyMeta {
+            keyid: e.key_id,
+            chunkid: e.chunk_id,
+            ttl: ttl_instant,
+            updated_at: now,
+        };
+        core.insert_meta_only(e.key, meta);
+    }
+
     Ok(())
 }

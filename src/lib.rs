@@ -24,13 +24,9 @@ mod error;
 mod meta;
 mod wal;
 
-/// =======================
-/// Протокол команд
-/// =======================
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum CacheCommand {
-    Set(String, Vec<u8>, i64), // key, value, ttl_ms (-1 = no ttl)
+    Set(String, Vec<u8>, i64),
     Get(String),
     Pop(String),
     Del(String),
@@ -61,10 +57,6 @@ fn write_all(stream: &mut impl Write, buf: &[u8]) -> Result<(), CacheError> {
         .map_err(|e| CacheError::Network(format!("write_all: {}", e)))
 }
 
-/// =======================
-/// PersistentCore
-/// =======================
-
 struct PersistentCore {
     paths: Paths,
     core: CacheCore,
@@ -83,6 +75,7 @@ impl PersistentCore {
         let core = CacheCore::new();
 
         load_keys_meta(&paths, &core)?;
+
         let wal = Wal::open(paths.wal_log())?;
         wal.replay(&core, state.current_chunk_id)?;
 
@@ -267,10 +260,6 @@ impl PersistentCore {
     }
 }
 
-/// =======================
-/// Очередь + worker‑тред
-/// =======================
-
 enum WorkerRequest {
     Command(CacheCommand, mpsc::Sender<CacheResponse>),
 }
@@ -346,10 +335,6 @@ impl ServerCore {
     }
 }
 
-/// =======================
-/// Обработка соединения
-/// =======================
-
 fn handle_connection_impl<S: Read + Write>(
     stream: &mut S,
     server: Arc<ServerCore>,
@@ -395,10 +380,6 @@ fn handle_connection_unix(
     handle_connection_impl(stream, server)
 }
 
-/// =======================
-/// TCP‑сервер
-/// =======================
-
 #[pyfunction(signature = (data_dir, port=5002, snapshot_interval_secs=60, retention_chunks=3))]
 fn serve(
     data_dir: String,
@@ -442,10 +423,6 @@ fn serve(
 
     Ok(())
 }
-
-/// =======================
-/// UDS‑сервер (Unix)
-/// =======================
 
 #[cfg(unix)]
 #[pyfunction(signature = (data_dir, snapshot_interval_secs=60, retention_chunks=3))]
@@ -497,10 +474,6 @@ fn serve_unix(
 
     Ok(())
 }
-
-/// =======================
-/// Client helpers
-/// =======================
 
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
@@ -562,7 +535,10 @@ fn send_cmd(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<()> {
     }
 }
 
-fn send_cmd_expect_value(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<Option<Vec<u8>>> {
+fn send_cmd_expect_value(
+    stream: &mut dyn ReadWrite,
+    cmd: CacheCommand,
+) -> PyResult<Option<Vec<u8>>> {
     let data =
         bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
     let len = (data.len() as u32).to_le_bytes();
@@ -597,7 +573,10 @@ fn send_cmd_expect_int(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResul
     }
 }
 
-fn send_cmd_expect_keys(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<Vec<String>> {
+fn send_cmd_expect_keys(
+    stream: &mut dyn ReadWrite,
+    cmd: CacheCommand,
+) -> PyResult<Vec<String>> {
     let data =
         bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
     let len = (data.len() as u32).to_le_bytes();
@@ -613,10 +592,6 @@ fn send_cmd_expect_keys(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResu
         r => Err(PyRuntimeError::new_err(format!("unexpected response: {:?}", r))),
     }
 }
-
-/// =======================
-/// TinyCache (Python API)
-/// =======================
 
 #[pyclass]
 struct TinyCache {
