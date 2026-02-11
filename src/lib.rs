@@ -291,7 +291,6 @@ impl PersistentCore {
             key: key.clone(),
             value: value.clone(),
             ttl_ms,
-            chunk_id: current_chunk_id,
         })?;
         self.core.set(key, value, ttl, current_chunk_id);
         Ok(())
@@ -484,7 +483,6 @@ fn serve(
     retention_chunks: u64,
 ) -> PyResult<()> {
     let addr = format!("127.0.0.1:{}", port);
-    println!("TinyCache TCP server: {}", addr);
 
     let core = Arc::new(
         PersistentCore::new(
