@@ -123,6 +123,13 @@ pub fn load_or_init_state(
 
 pub fn save_state(paths: &Paths, state: &StateMeta) -> Result<(), CacheError> {
     let state_path = paths.state_json();
+
+    // Гарантируем существование директории
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| CacheError::Internal(format!("ensure state dir: {}", e)))?;
+    }
+
     let tmp = state_path.with_extension("tmp");
     let data =
         serde_json::to_vec_pretty(state).map_err(|e| CacheError::Serialization(e.to_string()))?;
@@ -189,6 +196,13 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
 
 pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
+
+    // Гарантируем существование директории
+    if let Some(parent) = keys_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| CacheError::Internal(format!("ensure keys.bin dir: {}", e)))?;
+    }
+
     let tmp = keys_path.with_extension("tmp");
 
     #[derive(Serialize)]
