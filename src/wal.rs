@@ -1,5 +1,6 @@
 use crate::core::CacheCore;
 use crate::error::CacheError;
+use crate::core::ChunkId;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
@@ -9,9 +10,18 @@ use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum WalRecord {
-    Set { key: String, value: Vec<u8>, ttl_ms: i64 },
-    Del { key: String },
-    Pop { key: String },
+    Set {
+        key: String,
+        value: Vec<u8>,
+        ttl_ms: i64,
+        chunk_id: ChunkId,
+    },
+    Del {
+        key: String,
+    },
+    Pop {
+        key: String,
+    },
 }
 
 pub struct Wal {
@@ -47,7 +57,11 @@ impl Wal {
             .map_err(|e| CacheError::Internal(format!("write WAL: {}", e)))
     }
 
-    pub fn replay(&self, core: &CacheCore) -> Result<(), CacheError> {
+    pub fn replay(
+        &self,
+        core: &CacheCore,
+        current_chunk_id: ChunkId,
+    ) -> Result<(), CacheError> {
         use std::io::ErrorKind;
 
         let mut f = File::open(&self.path)
@@ -62,7 +76,6 @@ impl Wal {
                     return Err(CacheError::Internal(format!("read WAL len: {}", e)));
                 }
             }
-
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut buf = vec![0u8; len];
             f.read_exact(&mut buf)
@@ -72,13 +85,18 @@ impl Wal {
                 bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
             match rec {
-                WalRecord::Set { key, value, ttl_ms } => {
+                WalRecord::Set {
+                    key,
+                    value,
+                    ttl_ms,
+                    chunk_id: _,
+                } => {
                     let ttl = if ttl_ms < 0 {
                         None
                     } else {
                         Some(Duration::from_millis(ttl_ms as u64))
                     };
-                    core.set(key, value, ttl);
+                    core.set(key, value, ttl, current_chunk_id);
                 }
                 WalRecord::Del { key } => {
                     core.delete(&key);
@@ -103,4 +121,8 @@ impl Wal {
             .map_err(|e| CacheError::Internal(format!("truncate WAL: {}", e)))?;
         Ok(())
     }
+
+    // pub fn path(&self) -> &PathBuf {
+    //     &self.path
+    // }
 }
