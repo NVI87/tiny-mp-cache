@@ -83,7 +83,11 @@ impl Wal {
                 bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
             match rec {
-                WalRecord::Set { key, value, ttl_ms } => {
+                WalRecord::Set {
+                    key,
+                    value,
+                    ttl_ms,
+                } => {
                     let ttl = if ttl_ms < 0 {
                         None
                     } else {
@@ -103,6 +107,7 @@ impl Wal {
         Ok(())
     }
 
+    /// Обнулить WAL после snapshot'а.
     pub fn reset(&self) -> Result<(), CacheError> {
         let mut f = self
             .file
