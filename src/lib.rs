@@ -176,7 +176,7 @@ impl PersistentCore {
             state.live_chunks.push(current_chunk_id);
         }
 
-        save_keys_meta(&self.paths, &self.core, &state)?;
+        save_keys_meta(&self.paths, &self.core)?;
 
         let new_chunk_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -244,10 +244,28 @@ impl PersistentCore {
     }
 
     fn pop(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
+            wal.append(&WalRecord::Pop {
+                key: key.to_string(),
+            })?;
+        }
         Ok(self.core.pop(key))
     }
 
     fn delete(&self, key: &str) -> Result<i64, CacheError> {
+        {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
+            wal.append(&WalRecord::Del {
+                key: key.to_string(),
+            })?;
+        }
         Ok(self.core.delete(key))
     }
 
@@ -257,6 +275,13 @@ impl PersistentCore {
 
     fn len(&self) -> Result<i64, CacheError> {
         Ok(self.core.len())
+    }
+}
+
+impl Drop for PersistentCore {
+    fn drop(&mut self) {
+        // Graceful shutdown: сохраняем состояние перед выходом
+        let _ = self.do_snapshot();
     }
 }
 
