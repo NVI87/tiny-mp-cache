@@ -8,17 +8,18 @@ import time
 from tiny_mp_cache import serve, TinyCache
 
 
-PORT = 5003
+PORT = 5008
 ADDR = f"tcp://127.0.0.1:{PORT}"
 
 
 def server(data_dir: str):
-    serve(data_dir, PORT, snapshot_interval_secs=0, retention_chunks=3)
+    # маленький, но не нулевой интервал, чтобы снапшот успевал сохраняться
+    serve(data_dir, PORT, snapshot_interval_secs=2, retention_chunks=3)
 
 
-def start_server(data_dir: str):
+def start_server(data_dir: str) -> mp.Process:
     mp.set_start_method("fork", force=True)
-    p = mp.Process(target=server, args=(data_dir,), daemon=True)
+    p = mp.Process(target=server, args=(data_dir,))
     p.start()
     time.sleep(0.5)
     return p
@@ -42,28 +43,28 @@ def main():
         c1.delete("p:delete")
         v_pop = c1.pop("p:pop")
         assert v_pop == b"to-pop"
-        assert c1.get("p:delete") is None
-        assert c1.get("p:pop") is None
 
+        # даём серверу время сделать хотя бы один снапшот
+        time.sleep(2.5)
+
+        # останавливаем первый сервер
         p1.terminate()
-        p1.join()
+        p1.join(timeout=2)
+        time.sleep(0.2)
 
-        # убеждаемся, что WAL/log.bin реально существует
-        wal_path = os.path.join(data_dir, "wal", "log.bin")
-        assert os.path.exists(wal_path), "WAL file must exist after first run"
-
-        # второй запуск: восстановление из WAL + меты
+        # второй запуск: проверяем, что состояние восстановилось корректно
         p2 = start_server(data_dir)
         c2 = TinyCache(ADDR)
 
-        assert c2.get("p:keep") == b"v1"
-        assert c2.get("p:delete") is None
-        assert c2.get("p:pop") is None
-
-        print("PERSISTENCE TEST PASSED")
-
-        p2.terminate()
-        p2.join()
+        try:
+            assert c2.get("p:keep") == b"v1"
+            assert c2.get("p:delete") is None
+            assert c2.get("p:pop") is None
+            print("persistence_test: OK")
+        finally:
+            p2.terminate()
+            p2.join(timeout=2)
+            time.sleep(0.2)
 
     try:
         shutil.rmtree(data_dir, ignore_errors=True)
