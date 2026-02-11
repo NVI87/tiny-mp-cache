@@ -14,7 +14,6 @@ pub enum WalRecord {
         key: String,
         value: Vec<u8>,
         ttl_ms: i64,
-        chunk_id: ChunkId,
     },
     Del {
         key: String,
@@ -85,12 +84,7 @@ impl Wal {
                 bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
             match rec {
-                WalRecord::Set {
-                    key,
-                    value,
-                    ttl_ms,
-                    chunk_id: _,
-                } => {
+                WalRecord::Set { key, value, ttl_ms } => {
                     let ttl = if ttl_ms < 0 {
                         None
                     } else {
@@ -121,8 +115,4 @@ impl Wal {
             .map_err(|e| CacheError::Internal(format!("truncate WAL: {}", e)))?;
         Ok(())
     }
-
-    // pub fn path(&self) -> &PathBuf {
-    //     &self.path
-    // }
 }

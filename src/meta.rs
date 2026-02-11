@@ -187,7 +187,7 @@ pub fn load_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
     Ok(())
 }
 
-pub fn save_keys_meta(paths: &Paths, core: &CacheCore, state: &StateMeta) -> Result<(), CacheError> {
+pub fn save_keys_meta(paths: &Paths, core: &CacheCore, _state: &StateMeta) -> Result<(), CacheError> {
     let keys_path = paths.keys_bin();
     let tmp = keys_path.with_extension("tmp");
 
@@ -201,10 +201,10 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore, state: &StateMeta) -> Res
     let entries: Vec<KeyMetaDisk> = core
         .export_meta_for_disk()
         .into_iter()
-        .map(|(key, key_id, ttl, _updated_at)| KeyMetaDisk {
+        .map(|(key, key_id, chunk_id, ttl, _updated_at)| KeyMetaDisk {
             key,
             key_id,
-            chunk_id: state.current_chunk_id,
+            chunk_id,
             ttl_ms: ttl.map(|d| d.as_millis() as i64).unwrap_or(-1),
             updated_at_ms: now_ms,
         })
@@ -234,4 +234,3 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore, state: &StateMeta) -> Res
         .map_err(|e| CacheError::Internal(format!("rename keys.tmp: {}", e)))?;
     Ok(())
 }
-

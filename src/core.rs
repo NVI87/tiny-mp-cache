@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,25 +47,25 @@ impl CacheCore {
         self.meta_by_key.insert(key, meta);
     }
 
-    /// Экспорт меты для keys.bin: (cache_key, key_id, ttl, updated_at).
+    /// Экспорт меты для keys.bin: (cache_key, key_id, chunk_id, ttl, updated_at).
     pub fn export_meta_for_disk(
         &self,
-    ) -> Vec<(String, KeyId, Option<Duration>, Instant)> {
+    ) -> Vec<(String, KeyId, ChunkId, Option<Duration>, Instant)> {
         let mut res = Vec::new();
         let now = Instant::now();
         for entry in self.meta_by_key.iter() {
             let key = entry.key().clone();
             let key_id = entry.key_id;
+            let chunk_id = entry.chunk_id;
             let ttl_dur = entry
                 .ttl
                 .and_then(|t| if t > now { Some(t - now) } else { None });
-            res.push((key, key_id, ttl_dur, entry.updated_at));
+            res.push((key, key_id, chunk_id, ttl_dur, entry.updated_at));
         }
         res
     }
 
-    /// Полный dump «живых» ключей для snapshot’а текущего чанка:
-    /// возвращаем (key_id, value, оставшийся TTL).
+    /// Дамп «живых» ключей для snapshot’а текущего чанка.
     pub fn export_live_for_chunk(
         &self,
         current_chunk_id: ChunkId,
@@ -95,7 +96,7 @@ impl CacheCore {
     /// Жёсткая очистка по TTL и по "неживым" chunk_id.
     pub fn gc(&self, live_chunks: &[ChunkId]) {
         let now = Instant::now();
-        let live: std::collections::HashSet<ChunkId> = live_chunks.iter().cloned().collect();
+        let live: HashSet<ChunkId> = live_chunks.iter().cloned().collect();
         let mut to_delete = Vec::new();
 
         for entry in self.meta_by_key.iter() {
@@ -119,19 +120,23 @@ impl CacheCore {
         }
     }
 
+    /// Берём мету с ленивой очисткой TTL. Без iter_mut на горячем пути.
     pub fn get_meta(&self, key: &str) -> Option<KeyMeta> {
-        let entry = self.meta_by_key.get_mut(key)?;
-        if let Some(ttl) = entry.ttl {
-            if Instant::now() >= ttl {
-                let key_id = entry.key_id;
-                let key_str = entry.key().clone();
-                drop(entry);
-                self.meta_by_key.remove(&key_str);
-                self.values.remove(&key_id);
-                return None;
+        // Сначала просто смотрим.
+        if let Some(entry) = self.meta_by_key.get(key) {
+            if let Some(ttl) = entry.ttl {
+                if Instant::now() >= ttl {
+                    let key_id = entry.key_id;
+                    let key_str = entry.key().clone();
+                    drop(entry);
+                    self.meta_by_key.remove(&key_str);
+                    self.values.remove(&key_id);
+                    return None;
+                }
             }
+            return Some(entry.clone());
         }
-        Some(entry.clone())
+        None
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
@@ -182,22 +187,24 @@ impl CacheCore {
     pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
         let now = Instant::now();
         let mut res = Vec::new();
+        let mut to_delete = Vec::new();
 
-        for entry in self.meta_by_key.iter_mut() {
+        for entry in self.meta_by_key.iter() {
             if !entry.key().starts_with(prefix) {
                 continue;
             }
             if let Some(ttl) = entry.ttl {
                 if now >= ttl {
-                    let key = entry.key().clone();
-                    let key_id = entry.key_id;
-                    drop(entry);
-                    self.meta_by_key.remove(&key);
-                    self.values.remove(&key_id);
+                    to_delete.push((entry.key().clone(), entry.key_id));
                     continue;
                 }
             }
             res.push(entry.key().clone());
+        }
+
+        for (k, id) in to_delete {
+            self.meta_by_key.remove(&k);
+            self.values.remove(&id);
         }
 
         res
