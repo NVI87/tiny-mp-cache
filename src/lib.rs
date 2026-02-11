@@ -209,6 +209,12 @@ impl PersistentCore {
         let chunk_path = paths.chunk_file(current_chunk_id);
         let tmp = chunk_path.with_extension("tmp");
 
+        // гарантируем, что каталог для чанков существует
+        if let Some(parent) = chunk_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CacheError::Internal(format!("create chunks dir: {}", e)))?;
+        }
+
         {
             let mut f = std::fs::File::create(&tmp)
                 .map_err(|e| CacheError::Internal(format!("create chunk tmp: {}", e)))?;
@@ -477,7 +483,6 @@ fn serve(
     snapshot_interval_secs: u64,
     retention_chunks: u64,
 ) -> PyResult<()> {
-    println!("*** NEW SERVE VERSION ***");
     let addr = format!("127.0.0.1:{}", port);
     println!("TinyCache TCP server: {}", addr);
 

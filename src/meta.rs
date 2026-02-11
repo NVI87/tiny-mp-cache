@@ -218,6 +218,11 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore, state: &StateMeta) -> Res
     let data =
         bincode::serialize(&file).map_err(|e| CacheError::Serialization(e.to_string()))?;
 
+    if let Some(parent) = keys_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| CacheError::Internal(format!("create meta dir in save_keys_meta: {}", e)))?;
+    }
+
     {
         let mut f = File::create(&tmp)
             .map_err(|e| CacheError::Internal(format!("create keys.tmp: {}", e)))?;
