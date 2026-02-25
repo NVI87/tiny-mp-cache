@@ -22,8 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use bincode;
-#[cfg(unix)]
-use std::fs;
+/// #[cfg(unix)]
+/// use std::fs;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
