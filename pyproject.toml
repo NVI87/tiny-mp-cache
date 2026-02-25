@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tiny-mp-cache"
-version = "0.1.9"
+version = "0.1.10"
 description = "1μs multiprocessing cache (TCP/Unix socket)"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
