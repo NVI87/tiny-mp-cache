@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-import multiprocessing as mp
-import time
+"""
+Нагрузочный сценарий «очередь задач»: продюсер кладёт задачи, воркеры
+разбирают их через pop. Каждая задача должна быть обработана ровно один раз.
+"""
 import json
-from tiny_mp_cache import serve, serve_unix, TinyCache
+import multiprocessing as mp
+import os
+import tempfile
+import time
 
-TCP_PORT = 5002
-TCP_ADDR = f"127.0.0.1:{TCP_PORT}"
+import tiny_mp_cache
+from tiny_mp_cache import serve, TinyCache
 
-UDS_PATH = "/tmp/tiny-mp-cache-test.sock"
-UDS_ADDR = f"unix://{UDS_PATH}"
+TCP_PORT = 5018
+TCP_ADDR = f"tcp://127.0.0.1:{TCP_PORT}"
 
 N_JOBS = 1000
 N_WORKERS = 8
 WORK_TIME = 0.001  # 1 мс на задачу
 
 
-def tcp_server():
-    serve(TCP_PORT)
+def tcp_server(data_dir: str):
+    serve(data_dir, TCP_PORT)
 
 
-def uds_server():
-    serve_unix(UDS_PATH)
+def uds_server(data_dir: str):
+    tiny_mp_cache.serve_unix(data_dir)
+
+
+def uds_addr(data_dir: str) -> str:
+    # serve_unix слушает сокет <data_dir>/ipc/tiny-cache.sock
+    return "unix://" + os.path.join(data_dir, "ipc", "tiny-cache.sock")
 
 
 def make_job_key(i: int) -> str:
@@ -38,7 +48,7 @@ def producer(addr: str):
 def worker(worker_id: int, addr: str, processed_ids):
     """
     processed_ids — общая manager.list(), используется только для проверки
-    отсутствия повторной обработки задач, не для бизнес-логики. [web:110]
+    отсутствия повторной обработки задач, не для бизнес-логики.
     """
     cache = TinyCache(addr)
     processed = 0
@@ -57,11 +67,10 @@ def worker(worker_id: int, addr: str, processed_ids):
     print(f"[WORKER {worker_id} {addr}] processed {processed} jobs")
 
 
-def run_load_test(name: str, addr: str, server_target):
+def run_load_test(name: str, addr: str, server_target, data_dir: str):
     print(f"\n=== {name} load test ===")
-    mp.set_start_method("fork", force=True)
 
-    srv = mp.Process(target=server_target, daemon=True)
+    srv = mp.Process(target=server_target, args=(data_dir,), daemon=True)
     srv.start()
     time.sleep(0.5)
 
@@ -95,25 +104,27 @@ def run_load_test(name: str, addr: str, server_target):
         print(f"elapsed    : {t1 - t0:.3f} s")
         print(f"processed  : total={len(ids)}, unique={len(unique_ids)}, duplicates={duplicates}")
 
-        if len(unique_ids) != N_JOBS:
-            missing = set(range(N_JOBS)) - unique_ids
-            print(f"WARNING: missing {len(missing)} jobs, e.g. {sorted(list(missing))[:10]}")
-        if duplicates:
-            print("ERROR: some jobs were processed more than once!")
-        else:
-            print("OK: no duplicate processing detected")
+        missing = set(range(N_JOBS)) - unique_ids
+        assert not missing, f"missing {len(missing)} jobs, e.g. {sorted(missing)[:10]}"
+        assert not duplicates, f"{duplicates} jobs were processed more than once"
+        print("OK: every job processed exactly once")
 
+    srv.terminate()
+    srv.join(timeout=5)
     print(f"ALL DONE ({name})")
 
 
 def main():
-    # TCP
-    run_load_test("TCP", TCP_ADDR, tcp_server)
+    mp.set_start_method("fork", force=True)
+
+    with tempfile.TemporaryDirectory(prefix="tiny-mp-cache-full-") as data_dir:
+        run_load_test("TCP", TCP_ADDR, tcp_server, data_dir)
 
     # UDS (только на Unix)
-    try:
-        run_load_test("UDS", UDS_ADDR, uds_server)
-    except (AttributeError, OSError):
+    if hasattr(tiny_mp_cache, "serve_unix"):
+        with tempfile.TemporaryDirectory(prefix="tiny-mp-cache-full-") as data_dir:
+            run_load_test("UDS", uds_addr(data_dir), uds_server, data_dir)
+    else:
         print("\nUDS load test skipped (not supported on this platform)")
 
 

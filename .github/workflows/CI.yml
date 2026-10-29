@@ -185,6 +185,7 @@ jobs:
           python crash_consistency_test.py
           python retention_test.py
           python graceful_shutdown_test.py
+          python full_test.py
 
   release:
     name: Release
