@@ -172,7 +172,9 @@ jobs:
       - name: Install wheel
         shell: bash
         run: pip install dist/*.whl
+      # запускаем вне корня репо, чтобы исходники tiny_mp_cache/ не перекрывали установленный wheel
       - name: Check import
+        working-directory: tests
         run: python -c "import tiny_mp_cache; print(tiny_mp_cache.__all__)"
       - name: Run tests (Unix)
         if: runner.os != 'Windows'
