@@ -1,10 +1,10 @@
-use crate::core::CacheCore;
+use crate::core::{CacheCore, ChunkId};
 use crate::error::CacheError;
 use crate::meta::{
     load_chunks, load_keys_meta, load_or_init_state, save_keys_meta, save_state, Paths,
     StateMeta,
 };
-use crate::wal::{Wal, WalRecord};
+use crate::wal::{segment_path, Wal, WalRecord};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -62,7 +62,20 @@ struct PersistentCore {
     paths: Paths,
     core: CacheCore,
     state: Mutex<StateMeta>,
-    wal: Mutex<Wal>,
+    wal: Wal,
+    /// Чанки, у которых есть сегмент WAL, но которые ещё не сохранены snapshot'ом.
+    pending: Mutex<Vec<ChunkId>>,
+    /// do_snapshot не должен выполняться параллельно сам с собой.
+    snapshot_lock: Mutex<()>,
+}
+
+/// Новый chunk_id: unix-время в мс, но строго больше предыдущего.
+fn next_chunk_id(prev: ChunkId) -> ChunkId {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    now.max(prev + 1)
 }
 
 impl PersistentCore {
@@ -81,9 +94,10 @@ impl PersistentCore {
         fs::create_dir_all(&paths.chunks_dir)
             .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
 
-        let state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
+        let mut state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
         let core = CacheCore::new();
 
+        // 1. мета + значения из сохранённых чанков
         load_keys_meta(&paths, &core)?;
         core.bump_next_key_id();
         load_chunks(&paths, &core, &state.live_chunks)?;
@@ -92,16 +106,43 @@ impl PersistentCore {
             eprintln!("TinyCache: dropped {} keys without values in chunks", orphans);
         }
 
-        let wal = Wal::open(paths.wal_log())?;
-        wal.replay(&core, state.current_chunk_id)?;
+        // старый формат (единый wal/log.bin) -> сегмент текущего чанка
+        let legacy_wal = paths.wal_log();
+        if legacy_wal.exists() {
+            fs::rename(&legacy_wal, segment_path(&paths.wal_dir, state.current_chunk_id))
+                .map_err(|e| CacheError::Internal(format!("migrate legacy WAL: {}", e)))?;
+        }
 
-        core.gc(&state.live_chunks, state.current_chunk_id);
+        // 2. доигрываем все сегменты WAL, ещё не свёрнутые в чанки
+        let segments = Wal::list_segments(&paths.wal_dir)?;
+        for &id in &segments {
+            Wal::replay_segment(&paths.wal_dir, id, &core)?;
+        }
+
+        // 3. новые записи идут в свежий чанк; доигранные сегменты сохранит ближайший snapshot
+        let max_known = segments
+            .iter()
+            .chain(state.live_chunks.iter())
+            .copied()
+            .chain(std::iter::once(state.current_chunk_id))
+            .max()
+            .unwrap_or(0);
+        let current = next_chunk_id(max_known);
+        state.current_chunk_id = current;
+        let wal = Wal::open(paths.wal_dir.clone(), current)?;
+
+        let mut keep = state.live_chunks.clone();
+        keep.extend(&segments);
+        core.gc(&keep, current);
+        save_state(&paths, &state)?;
 
         let this = Arc::new(PersistentCore {
             paths,
             core,
             state: Mutex::new(state),
-            wal: Mutex::new(wal),
+            wal,
+            pending: Mutex::new(segments),
+            snapshot_lock: Mutex::new(()),
         });
 
         Self::spawn_snapshot_thread(&this);
@@ -128,88 +169,62 @@ impl PersistentCore {
         });
     }
 
+    /// Snapshot без потери записей, идущих параллельно:
+    /// 1) под блокировкой WAL переключаем запись на новый чанк (rotate);
+    /// 2) сохраняем прежний чанк (и не сохранённые ранее), keys.bin и state.json;
+    /// 3) только после этого удаляем их сегменты WAL.
+    /// Падение на любом шаге безопасно: оставшиеся сегменты доиграются при старте.
     fn do_snapshot(&self) -> Result<(), CacheError> {
+        let _snap = self
+            .snapshot_lock
+            .lock()
+            .map_err(|_| CacheError::Internal("snapshot mutex poisoned".into()))?;
+
         let mut state = self
             .state
             .lock()
             .map_err(|_| CacheError::Internal("state mutex poisoned".into()))?
             .clone();
 
-        if !state.live_chunks.is_empty() && state.live_chunks.len() as u64 > state.retention_chunks
+        let new_chunk_id = next_chunk_id(state.current_chunk_id);
+        let old_chunk_id = self.wal.rotate(new_chunk_id)?;
+        state.current_chunk_id = new_chunk_id;
         {
-            let keep = state.retention_chunks as usize;
-            let to_drop = state.live_chunks.len() - keep;
-            let old = state.live_chunks.drain(0..to_drop).collect::<Vec<_>>();
-            for id in old {
-                let p = self.paths.chunk_file(id);
-                if p.exists() {
-                    let _ = fs::remove_file(&p);
-                }
-            }
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| CacheError::Internal("state mutex poisoned".into()))?;
+            guard.current_chunk_id = new_chunk_id;
         }
 
-        self.core.gc(&state.live_chunks, state.current_chunk_id);
+        let to_flush = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| CacheError::Internal("pending mutex poisoned".into()))?;
+            pending.push(old_chunk_id);
+            pending.clone()
+        };
 
-        let current_chunk_id = state.current_chunk_id;
-        let live = self.core.export_live_for_chunk(current_chunk_id);
-        if !live.is_empty() {
-            let chunk_path = self.paths.chunk_file(current_chunk_id);
+        state.live_chunks.extend(&to_flush);
+        state.live_chunks.sort_unstable();
+        state.live_chunks.dedup();
 
-            // Гарантируем существование директории chunks
-            if let Some(parent) = chunk_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
-            }
-
-            let tmp = chunk_path.with_extension("tmp");
-            {
-                let mut f = fs::File::create(&tmp)
-                    .map_err(|e| CacheError::Internal(format!("create chunk tmp: {}", e)))?;
-
-                let magic = b"TMCK";
-                let version = 1u32;
-                let count = live.len() as u64;
-                f.write_all(magic)
-                    .map_err(|e| CacheError::Internal(format!("write magic: {}", e)))?;
-                f.write_all(&version.to_le_bytes())
-                    .map_err(|e| CacheError::Internal(format!("write ver: {}", e)))?;
-                f.write_all(&current_chunk_id.to_le_bytes())
-                    .map_err(|e| CacheError::Internal(format!("write id: {}", e)))?;
-                f.write_all(&count.to_le_bytes())
-                    .map_err(|e| CacheError::Internal(format!("write count: {}", e)))?;
-
-                for (key_id, value, _ttl) in live {
-                    let key_id_bytes = key_id.to_le_bytes();
-                    let len = (value.len() as u32).to_le_bytes();
-                    f.write_all(&key_id_bytes)
-                        .and_then(|_| f.write_all(&len))
-                        .and_then(|_| f.write_all(&value))
-                        .map_err(|e| CacheError::Internal(format!("write chunk kv: {}", e)))?;
-                }
-                f.flush()
-                    .map_err(|e| CacheError::Internal(format!("flush chunk: {}", e)))?;
-            }
-            fs::rename(&tmp, &chunk_path)
-                .map_err(|e| CacheError::Internal(format!("rename chunk: {}", e)))?;
+        let mut dropped = Vec::new();
+        if state.live_chunks.len() as u64 > state.retention_chunks {
+            let to_drop = state.live_chunks.len() - state.retention_chunks as usize;
+            dropped = state.live_chunks.drain(0..to_drop).collect();
         }
 
-        if !state.live_chunks.contains(&current_chunk_id) {
-            state.live_chunks.push(current_chunk_id);
+        self.core.gc(&state.live_chunks, new_chunk_id);
+
+        for &id in &to_flush {
+            if state.live_chunks.contains(&id) {
+                self.write_chunk(id)?;
+            }
         }
 
         save_keys_meta(&self.paths, &self.core)?;
-
-        let new_chunk_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let new_chunk_id = if new_chunk_id <= current_chunk_id {
-            current_chunk_id + 1
-        } else {
-            new_chunk_id
-        };
-
-        state.current_chunk_id = new_chunk_id;
         save_state(&self.paths, &state)?;
 
         {
@@ -217,17 +232,68 @@ impl PersistentCore {
                 .state
                 .lock()
                 .map_err(|_| CacheError::Internal("state mutex poisoned".into()))?;
-            *guard = state;
+            guard.live_chunks = state.live_chunks.clone();
         }
 
+        // всё нужное уже на диске: можно удалять устаревшие чанки и свёрнутые сегменты
+        for id in dropped {
+            let p = self.paths.chunk_file(id);
+            if p.exists() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+        for &id in &to_flush {
+            self.wal.remove_segment(id)?;
+        }
+        self.pending
+            .lock()
+            .map_err(|_| CacheError::Internal("pending mutex poisoned".into()))?
+            .retain(|id| !to_flush.contains(id));
+
+        Ok(())
+    }
+
+    /// Записать значения ключей чанка в chunks/chunk_<id>.bin (через tmp + rename).
+    fn write_chunk(&self, chunk_id: ChunkId) -> Result<(), CacheError> {
+        let live = self.core.export_live_for_chunk(chunk_id);
+        let chunk_path = self.paths.chunk_file(chunk_id);
+
+        // Гарантируем существование директории chunks
+        if let Some(parent) = chunk_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
+        }
+
+        let tmp = chunk_path.with_extension("tmp");
         {
-            let wal = self
-                .wal
-                .lock()
-                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
-            wal.reset()?;
-        }
+            let mut f = fs::File::create(&tmp)
+                .map_err(|e| CacheError::Internal(format!("create chunk tmp: {}", e)))?;
 
+            let magic = b"TMCK";
+            let version = 1u32;
+            let count = live.len() as u64;
+            f.write_all(magic)
+                .map_err(|e| CacheError::Internal(format!("write magic: {}", e)))?;
+            f.write_all(&version.to_le_bytes())
+                .map_err(|e| CacheError::Internal(format!("write ver: {}", e)))?;
+            f.write_all(&chunk_id.to_le_bytes())
+                .map_err(|e| CacheError::Internal(format!("write id: {}", e)))?;
+            f.write_all(&count.to_le_bytes())
+                .map_err(|e| CacheError::Internal(format!("write count: {}", e)))?;
+
+            for (key_id, value, _ttl) in live {
+                let key_id_bytes = key_id.to_le_bytes();
+                let len = (value.len() as u32).to_le_bytes();
+                f.write_all(&key_id_bytes)
+                    .and_then(|_| f.write_all(&len))
+                    .and_then(|_| f.write_all(&value))
+                    .map_err(|e| CacheError::Internal(format!("write chunk kv: {}", e)))?;
+            }
+            f.flush()
+                .map_err(|e| CacheError::Internal(format!("flush chunk: {}", e)))?;
+        }
+        fs::rename(&tmp, &chunk_path)
+            .map_err(|e| CacheError::Internal(format!("rename chunk: {}", e)))?;
         Ok(())
     }
 
@@ -238,26 +304,13 @@ impl PersistentCore {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let ttl_ms = ttl.map(|d| d.as_millis() as i64).unwrap_or(-1);
-
-        let current_chunk_id = {
-            let st = self.state.lock().unwrap();
-            st.current_chunk_id
+        let rec = WalRecord::Set {
+            key: key.clone(),
+            value: value.clone(),
+            ttl_ms,
         };
-
-        {
-            let wal = self
-                .wal
-                .lock()
-                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
-            wal.append(&WalRecord::Set {
-                key: key.clone(),
-                value: value.clone(),
-                ttl_ms,
-            })?;
-        }
-
-        self.core.set(key, value, ttl, current_chunk_id);
-        Ok(())
+        self.wal
+            .write(&rec, |chunk_id| self.core.set(key, value, ttl, chunk_id))
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
@@ -265,29 +318,17 @@ impl PersistentCore {
     }
 
     fn pop(&self, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        {
-            let wal = self
-                .wal
-                .lock()
-                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
-            wal.append(&WalRecord::Pop {
-                key: key.to_string(),
-            })?;
-        }
-        Ok(self.core.pop(key))
+        let rec = WalRecord::Pop {
+            key: key.to_string(),
+        };
+        self.wal.write(&rec, |_| self.core.pop(key))
     }
 
     fn delete(&self, key: &str) -> Result<i64, CacheError> {
-        {
-            let wal = self
-                .wal
-                .lock()
-                .map_err(|_| CacheError::Internal("wal mutex poisoned".into()))?;
-            wal.append(&WalRecord::Del {
-                key: key.to_string(),
-            })?;
-        }
-        Ok(self.core.delete(key))
+        let rec = WalRecord::Del {
+            key: key.to_string(),
+        };
+        self.wal.write(&rec, |_| self.core.delete(key))
     }
 
     fn keys_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
