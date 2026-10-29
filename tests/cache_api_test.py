@@ -16,11 +16,11 @@ UDS_ADDR_TEMPLATE = "unix://{sock}"  # форматируем позже
 def tcp_server(stop_event: mp.Event, data_dir: str):
     """
     TCP-сервер с супервизором: перезапускает serve() при крэше, пока не попросят остановиться.
-    snapshot_interval_secs=2, retention_chunks=3 – достаточно часто для теста.
+    snapshot_interval_secs=2, retention_secs=3 – достаточно часто для теста.
     """
     while not stop_event.is_set():
         try:
-            # позиционные аргументы: data_dir, port, snapshot_interval_secs, retention_chunks
+            # позиционные аргументы: data_dir, port, snapshot_interval_secs, retention_secs
             serve(data_dir, TCP_PORT, 2, 3)
             # нормальное завершение — выходим из цикла
             break
@@ -41,7 +41,7 @@ def uds_server(stop_event: mp.Event, data_dir: str, sock_path: str):
         try:
             if os.path.exists(sock_path):
                 os.remove(sock_path)
-            # позиционные: data_dir, snapshot_interval_secs, retention_chunks
+            # позиционные: data_dir, snapshot_interval_secs, retention_secs
             serve_unix(data_dir, 2, 3)
             break
         except Exception as e:

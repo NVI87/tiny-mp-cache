@@ -12,7 +12,10 @@ pub struct StateMeta {
     pub current_chunk_id: ChunkId,
     pub live_chunks: Vec<ChunkId>,
     pub snapshot_interval_secs: u64,
-    pub retention_chunks: u64,
+    /// Сколько секунд чанк хранится на диске; живые ключи устаревшего чанка
+    /// переносятся в свежий snapshot (это не TTL: данные не удаляются).
+    #[serde(default)]
+    pub retention_secs: u64,
 }
 
 impl StateMeta {
@@ -84,6 +87,28 @@ impl Paths {
         self.chunks_dir.join(format!("chunk_{}.bin", id))
     }
 
+    /// Chunk_id всех chunk-файлов на диске в порядке возрастания.
+    pub fn list_chunk_files(&self) -> Result<Vec<ChunkId>, CacheError> {
+        let mut ids = Vec::new();
+        let entries = fs::read_dir(&self.chunks_dir)
+            .map_err(|e| CacheError::Internal(format!("read chunks dir: {}", e)))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| CacheError::Internal(format!("read chunks dir: {}", e)))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name
+                .strip_prefix("chunk_")
+                .and_then(|s| s.strip_suffix(".bin"))
+                .and_then(|s| s.parse::<ChunkId>().ok())
+            {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     #[cfg(unix)]
     pub fn uds_path(&self) -> PathBuf {
         self.ipc_dir.join("tiny-cache.sock")
@@ -93,7 +118,7 @@ impl Paths {
 pub fn load_or_init_state(
     paths: &Paths,
     snapshot_interval_secs: u64,
-    retention_chunks: u64,
+    retention_secs: u64,
 ) -> Result<StateMeta, CacheError> {
     let state_path = paths.state_json();
     if state_path.exists() {
@@ -105,7 +130,7 @@ pub fn load_or_init_state(
         let mut state: StateMeta =
             serde_json::from_slice(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
         state.snapshot_interval_secs = snapshot_interval_secs;
-        state.retention_chunks = retention_chunks;
+        state.retention_secs = retention_secs;
         Ok(state)
     } else {
         let now = now_unix_ms() as u64;
@@ -114,7 +139,7 @@ pub fn load_or_init_state(
             current_chunk_id: now,
             live_chunks: Vec::new(),
             snapshot_interval_secs,
-            retention_chunks,
+            retention_secs,
         };
         save_state(paths, &state)?;
         Ok(state)

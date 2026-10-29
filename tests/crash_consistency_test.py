@@ -18,7 +18,7 @@ PORT = 5012
 ADDR = f"tcp://127.0.0.1:{PORT}"
 
 SNAPSHOT_INTERVAL_SECS = 1
-RETENTION_CHUNKS = 100
+RETENTION_SECS = 3600
 WRITE_SECONDS = 3.5  # несколько snapshot'ов за время записи
 
 
@@ -27,7 +27,7 @@ def server(data_dir: str):
         data_dir,
         PORT,
         snapshot_interval_secs=SNAPSHOT_INTERVAL_SECS,
-        retention_chunks=RETENTION_CHUNKS,
+        retention_secs=RETENTION_SECS,
     )
 
 

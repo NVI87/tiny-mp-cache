@@ -5,7 +5,7 @@ use crate::meta::{
     StateMeta,
 };
 use crate::wal::{segment_path, Wal, WalRecord};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -69,20 +70,23 @@ struct PersistentCore {
     snapshot_lock: Mutex<()>,
 }
 
-/// Новый chunk_id: unix-время в мс, но строго больше предыдущего.
-fn next_chunk_id(prev: ChunkId) -> ChunkId {
-    let now = std::time::SystemTime::now()
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64;
-    now.max(prev + 1)
+        .as_millis() as u64
+}
+
+/// Новый chunk_id: unix-время в мс, но строго больше предыдущего.
+fn next_chunk_id(prev: ChunkId) -> ChunkId {
+    now_ms().max(prev + 1)
 }
 
 impl PersistentCore {
     fn new(
         data_dir: PathBuf,
         snapshot_interval_secs: u64,
-        retention_chunks: u64,
+        retention_secs: u64,
     ) -> Result<Arc<Self>, CacheError> {
         let paths = Paths::new(&data_dir)?;
 
@@ -94,10 +98,18 @@ impl PersistentCore {
         fs::create_dir_all(&paths.chunks_dir)
             .map_err(|e| CacheError::Internal(format!("ensure chunks dir: {}", e)))?;
 
-        let mut state = load_or_init_state(&paths, snapshot_interval_secs, retention_chunks)?;
+        let mut state = load_or_init_state(&paths, snapshot_interval_secs, retention_secs)?;
         let core = CacheCore::new();
 
-        // 1. мета + значения из сохранённых чанков
+        // 1. мета + значения из сохранённых чанков. Берём все chunk-файлы на диске,
+        // а не только из state.json: snapshot мог упасть между сохранением
+        // keys.bin и state.json, а файлы удаляются последними
+        let mut live = state.live_chunks.clone();
+        live.extend(paths.list_chunk_files()?);
+        live.sort_unstable();
+        live.dedup();
+        state.live_chunks = live;
+
         load_keys_meta(&paths, &core)?;
         core.bump_next_key_id();
         load_chunks(&paths, &core, &state.live_chunks)?;
@@ -153,17 +165,16 @@ impl PersistentCore {
     fn spawn_snapshot_thread(this: &Arc<Self>) {
         let this_clone = Arc::clone(this);
         thread::spawn(move || loop {
-            let interval = {
-                let st = this_clone
-                    .state
-                    .lock()
-                    .expect("state mutex poisoned")
-                    .snapshot_interval_secs;
-                Duration::from_secs(st)
+            // snapshot'ы по строгой временной сетке: на границах, кратных интервалу
+            let interval_ms = {
+                let st = this_clone.state.lock().expect("state mutex poisoned");
+                st.snapshot_interval_secs * 1000
             };
-            thread::sleep(interval);
+            let now = now_ms();
+            let boundary = (now / interval_ms + 1) * interval_ms;
+            thread::sleep(Duration::from_millis(boundary - now));
 
-            if let Err(e) = this_clone.do_snapshot() {
+            if let Err(e) = this_clone.do_snapshot(boundary) {
                 eprintln!("snapshot error: {:?}", e);
             }
         });
@@ -171,10 +182,11 @@ impl PersistentCore {
 
     /// Snapshot без потери записей, идущих параллельно:
     /// 1) под блокировкой WAL переключаем запись на новый чанк (rotate);
-    /// 2) сохраняем прежний чанк (и не сохранённые ранее), keys.bin и state.json;
-    /// 3) только после этого удаляем их сегменты WAL.
-    /// Падение на любом шаге безопасно: оставшиеся сегменты доиграются при старте.
-    fn do_snapshot(&self) -> Result<(), CacheError> {
+    /// 2) retention: живые ключи чанков старше retention_secs переносим в сохраняемый чанк;
+    /// 3) сохраняем чанки, keys.bin и state.json;
+    /// 4) только после этого удаляем устаревшие chunk-файлы и свёрнутые сегменты WAL.
+    /// Падение на любом шаге безопасно: при старте читаются все chunk-файлы и сегменты.
+    fn do_snapshot(&self, at_ms: u64) -> Result<(), CacheError> {
         let _snap = self
             .snapshot_lock
             .lock()
@@ -186,7 +198,7 @@ impl PersistentCore {
             .map_err(|_| CacheError::Internal("state mutex poisoned".into()))?
             .clone();
 
-        let new_chunk_id = next_chunk_id(state.current_chunk_id);
+        let new_chunk_id = at_ms.max(state.current_chunk_id + 1);
         let old_chunk_id = self.wal.rotate(new_chunk_id)?;
         state.current_chunk_id = new_chunk_id;
         {
@@ -210,16 +222,25 @@ impl PersistentCore {
         state.live_chunks.sort_unstable();
         state.live_chunks.dedup();
 
-        let mut dropped = Vec::new();
-        if state.live_chunks.len() as u64 > state.retention_chunks {
-            let to_drop = state.live_chunks.len() - state.retention_chunks as usize;
-            dropped = state.live_chunks.drain(0..to_drop).collect();
+        // retention: chunk_id — время начала чанка (мс); прежний чанк сам не устаревает,
+        // т.к. retention_secs >= snapshot_interval_secs
+        let cutoff = new_chunk_id.saturating_sub(state.retention_secs * 1000);
+        let expired: HashSet<ChunkId> = state
+            .live_chunks
+            .iter()
+            .copied()
+            .filter(|&id| id < cutoff && id != old_chunk_id)
+            .collect();
+        if !expired.is_empty() {
+            self.core.reassign_chunks(&expired, old_chunk_id);
+            state.live_chunks.retain(|id| !expired.contains(id));
         }
 
         self.core.gc(&state.live_chunks, new_chunk_id);
 
+        // прежний чанк пишем всегда: в него могли перенести ключи устаревших
         for &id in &to_flush {
-            if state.live_chunks.contains(&id) {
+            if !expired.contains(&id) {
                 self.write_chunk(id)?;
             }
         }
@@ -236,7 +257,7 @@ impl PersistentCore {
         }
 
         // всё нужное уже на диске: можно удалять устаревшие чанки и свёрнутые сегменты
-        for id in dropped {
+        for &id in &expired {
             let p = self.paths.chunk_file(id);
             if p.exists() {
                 let _ = fs::remove_file(&p);
@@ -343,7 +364,7 @@ impl PersistentCore {
 impl Drop for PersistentCore {
     fn drop(&mut self) {
         // Graceful shutdown: сохраняем состояние перед выходом
-        let _ = self.do_snapshot();
+        let _ = self.do_snapshot(now_ms());
     }
 }
 
@@ -464,20 +485,35 @@ fn handle_connection_unix(
     handle_connection_impl(stream, server)
 }
 
-#[pyfunction(signature = (data_dir, port=5002, snapshot_interval_secs=60, retention_chunks=3))]
+/// snapshot_interval_secs > 0, retention_secs >= snapshot_interval_secs
+/// (иначе чанк устаревал бы раньше, чем успевает сохраниться).
+fn check_snapshot_config(snapshot_interval_secs: u64, retention_secs: u64) -> PyResult<()> {
+    if snapshot_interval_secs == 0 {
+        return Err(PyValueError::new_err("snapshot_interval_secs must be > 0"));
+    }
+    if retention_secs < snapshot_interval_secs {
+        return Err(PyValueError::new_err(
+            "retention_secs must be >= snapshot_interval_secs",
+        ));
+    }
+    Ok(())
+}
+
+#[pyfunction(signature = (data_dir, port=5002, snapshot_interval_secs=60, retention_secs=600))]
 fn serve(
     data_dir: String,
     port: u16,
     snapshot_interval_secs: u64,
-    retention_chunks: u64,
+    retention_secs: u64,
 ) -> PyResult<()> {
+    check_snapshot_config(snapshot_interval_secs, retention_secs)?;
     let addr = format!("127.0.0.1:{}", port);
     println!("TinyCache TCP server: {}", addr);
 
     let persistent = PersistentCore::new(
         PathBuf::from(&data_dir),
         snapshot_interval_secs,
-        retention_chunks,
+        retention_secs,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 
@@ -510,12 +546,13 @@ fn serve(
 }
 
 #[cfg(unix)]
-#[pyfunction(signature = (data_dir, snapshot_interval_secs=60, retention_chunks=3))]
+#[pyfunction(signature = (data_dir, snapshot_interval_secs=60, retention_secs=600))]
 fn serve_unix(
     data_dir: String,
     snapshot_interval_secs: u64,
-    retention_chunks: u64,
+    retention_secs: u64,
 ) -> PyResult<()> {
+    check_snapshot_config(snapshot_interval_secs, retention_secs)?;
     let paths =
         Paths::new(&data_dir).map_err(|e| PyRuntimeError::new_err(format!("init paths: {}", e)))?;
     let sock_path = paths.uds_path();
@@ -529,7 +566,7 @@ fn serve_unix(
     let persistent = PersistentCore::new(
         PathBuf::from(&data_dir),
         snapshot_interval_secs,
-        retention_chunks,
+        retention_secs,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 

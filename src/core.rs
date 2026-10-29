@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,19 @@ impl CacheCore {
             .iter()
             .map(|e| (e.key_id, e.chunk_id))
             .collect()
+    }
+
+    /// Retention: перенести ключи устаревших чанков в чанк `target`, который сейчас сохраняется.
+    /// Ключ, успевший перезаписаться в другой чанк, не трогаем. Возвращает число перенесённых.
+    pub fn reassign_chunks(&self, expired: &HashSet<ChunkId>, target: ChunkId) -> usize {
+        let mut moved = 0;
+        for mut entry in self.meta_by_key.iter_mut() {
+            if expired.contains(&entry.chunk_id) {
+                entry.chunk_id = target;
+                moved += 1;
+            }
+        }
+        moved
     }
 
     pub fn insert_value(&self, key_id: KeyId, value: Vec<u8>) {

@@ -21,8 +21,8 @@ PORT = 5008
 ADDR = f"tcp://127.0.0.1:{PORT}"
 
 SNAPSHOT_INTERVAL_SECS = 1
-# большой retention, чтобы вытеснение по чанкам не влияло на этот тест
-RETENTION_CHUNKS = 100
+# большой retention: перенос ключей из устаревших чанков проверяет retention_test
+RETENTION_SECS = 3600
 
 
 def server(data_dir: str):
@@ -30,7 +30,7 @@ def server(data_dir: str):
         data_dir,
         PORT,
         snapshot_interval_secs=SNAPSHOT_INTERVAL_SECS,
-        retention_chunks=RETENTION_CHUNKS,
+        retention_secs=RETENTION_SECS,
     )
 
 

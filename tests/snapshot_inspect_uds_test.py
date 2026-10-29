@@ -13,7 +13,7 @@ DATA_DIR = Path("./_snapshot_data_uds").absolute()
 
 
 def uds_server(data_dir: str, sock_path: str):
-    # snapshot_interval_secs=10, retention_chunks=15
+    # snapshot_interval_secs=10, retention_secs=15
     if os.path.exists(sock_path):
         os.remove(sock_path)
     serve_unix(data_dir, 10, 15)

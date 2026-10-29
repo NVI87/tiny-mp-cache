@@ -19,7 +19,7 @@ OPS_SETS = [1_000_000, 10_000_000]  # 100_000_000 слишком долго дл
 
 def server(data_dir: str):
     # маленький snapshot_interval, чтобы часто обнулять WAL
-    serve(data_dir, TCP_PORT, snapshot_interval_secs=30, retention_chunks=3)
+    serve(data_dir, TCP_PORT, snapshot_interval_secs=30, retention_secs=90)
 
 
 def start_server(data_dir: str):
