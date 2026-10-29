@@ -186,6 +186,7 @@ jobs:
           python retention_test.py
           python graceful_shutdown_test.py
           python full_test.py
+          python concurrency_test.py
 
   release:
     name: Release
