@@ -438,14 +438,14 @@ fn check_snapshot_config(snapshot_interval_secs: u64, retention_secs: u64) -> Py
 
 /// Обработчик SIGTERM: SystemExit(0) — serve() делает финальный snapshot и процесс завершается чисто.
 #[pyfunction]
-fn graceful_exit(_signum: i32, _frame: PyObject) -> PyResult<()> {
+fn graceful_exit(_signum: i32, _frame: Py<PyAny>) -> PyResult<()> {
     Err(PySystemExit::new_err(0))
 }
 
 /// Ставит graceful_exit на SIGTERM, если у процесса нет своего обработчика
 /// (и мы в главном потоке). Возвращает прежний обработчик для восстановления.
-fn install_sigterm_handler(py: Python<'_>) -> Option<PyObject> {
-    let signal = py.import_bound("signal").ok()?;
+fn install_sigterm_handler(py: Python<'_>) -> Option<Py<PyAny>> {
+    let signal = py.import("signal").ok()?;
     let sigterm = signal.getattr("SIGTERM").ok()?;
     let prev = signal.call_method1("getsignal", (sigterm.clone(),)).ok()?;
     let dfl = signal.getattr("SIG_DFL").ok()?;
@@ -457,9 +457,9 @@ fn install_sigterm_handler(py: Python<'_>) -> Option<PyObject> {
     Some(prev.unbind())
 }
 
-fn restore_sigterm_handler(py: Python<'_>, prev: Option<PyObject>) {
+fn restore_sigterm_handler(py: Python<'_>, prev: Option<Py<PyAny>>) {
     let Some(prev) = prev else { return };
-    if let Ok(signal) = py.import_bound("signal") {
+    if let Ok(signal) = py.import("signal") {
         if let Ok(sigterm) = signal.getattr("SIGTERM") {
             let _ = signal.call_method1("signal", (sigterm, prev));
         }
@@ -485,7 +485,7 @@ fn run_until_signal(
 
     let prev_handler = install_sigterm_handler(py);
     let result = loop {
-        py.allow_threads(|| thread::sleep(Duration::from_millis(100)));
+        py.detach(|| thread::sleep(Duration::from_millis(100)));
         if let Err(e) = py.check_signals() {
             break Err(e);
         }
@@ -494,7 +494,7 @@ fn run_until_signal(
         }
     };
 
-    if let Err(e) = py.allow_threads(|| persistent.do_snapshot(now_ms())) {
+    if let Err(e) = py.detach(|| persistent.do_snapshot(now_ms())) {
         eprintln!("final snapshot error: {:?}", e);
     }
     restore_sigterm_handler(py, prev_handler);
