@@ -448,10 +448,7 @@ fn handle_connection_impl<S: Read + Write>(
 
         let encoded =
             bincode::serialize(&resp).map_err(|e| CacheError::Serialization(e.to_string()))?;
-        let size = (encoded.len() as u32).to_le_bytes();
-
-        write_all(stream, &size)?;
-        write_all(stream, &encoded)?;
+        write_all(stream, &frame(&encoded))?;
     }
 }
 
@@ -494,6 +491,7 @@ fn serve(
     for stream_res in listener.incoming() {
         match stream_res {
             Ok(mut stream) => {
+                stream.set_nodelay(true).ok();
                 let server_clone = server_core.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_connection(&mut stream, server_clone) {
@@ -605,15 +603,26 @@ fn read_response(stream: &mut dyn ReadWrite) -> PyResult<CacheResponse> {
         .map_err(|e| PyRuntimeError::new_err(format!("deserialize response: {}", e)))
 }
 
-fn send_cmd(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<()> {
+/// Кадр протокола: длина (u32 LE) + тело. Отправляется одним write,
+/// иначе Nagle + delayed ACK дают ~40 мс задержки на каждый запрос (Linux).
+fn frame(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + data.len());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+fn write_cmd(stream: &mut dyn ReadWrite, cmd: &CacheCommand) -> PyResult<()> {
     let data =
-        bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
-    let len = (data.len() as u32).to_le_bytes();
+        bincode::serialize(cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
     stream
-        .write_all(&len)
-        .and_then(|_| stream.write_all(&data))
+        .write_all(&frame(&data))
         .and_then(|_| stream.flush())
-        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))
+}
+
+fn send_cmd(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<()> {
+    write_cmd(stream, &cmd)?;
 
     match read_response(stream)? {
         CacheResponse::Ok => Ok(()),
@@ -626,14 +635,7 @@ fn send_cmd_expect_value(
     stream: &mut dyn ReadWrite,
     cmd: CacheCommand,
 ) -> PyResult<Option<Vec<u8>>> {
-    let data =
-        bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
-    let len = (data.len() as u32).to_le_bytes();
-    stream
-        .write_all(&len)
-        .and_then(|_| stream.write_all(&data))
-        .and_then(|_| stream.flush())
-        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))?;
+    write_cmd(stream, &cmd)?;
 
     match read_response(stream)? {
         CacheResponse::Value(v) => Ok(Some(v)),
@@ -644,14 +646,7 @@ fn send_cmd_expect_value(
 }
 
 fn send_cmd_expect_int(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<i64> {
-    let data =
-        bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
-    let len = (data.len() as u32).to_le_bytes();
-    stream
-        .write_all(&len)
-        .and_then(|_| stream.write_all(&data))
-        .and_then(|_| stream.flush())
-        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))?;
+    write_cmd(stream, &cmd)?;
 
     match read_response(stream)? {
         CacheResponse::Int(n) => Ok(n),
@@ -664,14 +659,7 @@ fn send_cmd_expect_keys(
     stream: &mut dyn ReadWrite,
     cmd: CacheCommand,
 ) -> PyResult<Vec<String>> {
-    let data =
-        bincode::serialize(&cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
-    let len = (data.len() as u32).to_le_bytes();
-    stream
-        .write_all(&len)
-        .and_then(|_| stream.write_all(&data))
-        .and_then(|_| stream.flush())
-        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))?;
+    write_cmd(stream, &cmd)?;
 
     match read_response(stream)? {
         CacheResponse::Keys(k) => Ok(k),
