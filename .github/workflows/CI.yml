@@ -182,6 +182,7 @@ jobs:
         run: |
           python cache_api_test.py
           python persistence_test.py
+          python crash_consistency_test.py
 
   release:
     name: Release
