@@ -6,7 +6,9 @@
 Поддерживаются два транспорта:
 
 - TCP (`serve(port)`, адрес вида `"127.0.0.1:5002"`);
-- Unix domain socket (`serve_unix(path)`, адрес вида `"unix:///tmp/tiny-mp-cache.sock"`).
+- Unix domain socket (`serve_unix(path)`, адрес вида `"unix:///tmp/tiny-mp-cache.sock"`) — только Linux/macOS.
+
+На Windows доступен только TCP: функции `serve_unix` там нет, а `from tiny_mp_cache import serve_unix` вызовет `ImportError`.
 
 ***
 
@@ -302,21 +304,35 @@ def main():
 if __name__ == "__main__":
     main()
 ```
-Серверы serve и serve_unix также принимают опциональный аргумент wal_dir с указанием пути к директории с WAL-журналом
+***
+
+## Персистентность (WAL)
+
+Все изменяющие операции (`set`, `pop`, `delete`) пишутся в журнал `tiny-mp-cache.wal`; при старте сервер доигрывает журнал и восстанавливает состояние.
+
+По умолчанию журнал лежит в текущей директории. Каталог можно задать аргументом `wal_dir` (создаётся автоматически):
+
+```python
+serve(5002, wal_dir="/var/lib/tiny-mp-cache")
+serve_unix("/tmp/tiny-mp-cache.sock", wal_dir="/var/lib/tiny-mp-cache")
+```
+
+Журнал пока не компактируется и растёт со временем.
+
 ***
 
 ## Запуск тестов
 
-В репозитории есть два тестовых скрипта:
+В репозитории есть тестовые скрипты:
 
 - `tests/cache_api_test.py` — проверяет базовый API (`set`/`get`/`pop`/`delete`/`keys`/`len`) в одном процессе;
-- `tests/full_test.py` — нагрузочный многопроцессный сценарий с продюсером и воркерами.
+- `tests/full_test.py` — нагрузочный многопроцессный сценарий с продюсером и воркерами;
+- `tests/persistence_test.py` — восстановление состояния из WAL после перезапуска сервера.
 
 Перед запуском убедись, что активирован тот же venv, куда ставился пакет через `maturin develop` или установлен `tiny-mp-cache` из PyPI.
 
 ```bash
 python tests/cache_api_test.py
 python tests/full_test.py
+python tests/persistence_test.py
 ```
-
-[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/141613206/a38f3bab-bfa8-4ab8-bd63-63bcef40210d/image.jpg)

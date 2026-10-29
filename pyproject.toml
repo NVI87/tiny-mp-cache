@@ -4,17 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "tiny-mp-cache"
-version = "0.1.13"
+version = "0.1.14"
 description = "1μs multiprocessing cache (TCP/Unix socket)"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = {file = "LICENSE"}
 authors = [{name = "Nikita Ilin"}]
 readme = "README.md"
-
-[tool.maturin]
-module-name = "tiny_mp_cache"
-python-packages = ["tiny_mp_cache"]
-
 classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Rust",
@@ -22,8 +17,14 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Operating System :: MacOS :: MacOS X",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "License :: OSI Approved :: MIT License",
 ]
+
+[tool.maturin]
+module-name = "tiny_mp_cache"
+python-packages = ["tiny_mp_cache"]
+
 
 [project.urls]
 Homepage = "https://github.com/NVI87/tiny-mp-cache"

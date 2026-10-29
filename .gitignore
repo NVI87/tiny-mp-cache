@@ -1,24 +1,24 @@
-cat > .gitignore << 'EOF'
 # Python
 .venv/
 __pycache__/
 *.py[cod]
 *$py.class
-.pytest_cache/
-
-# Rust
-target/
-Cargo.lock  # ← УБЕРЁМ потом!
-
-# OS
-.DS_Store
-EOF
-
-*.pyc
-*.pyo
 *.pyd
 *.so
 *.dll
 *.whl
+.pytest_cache/
+
+# Rust
+target/
+
+# IDE
 .idea/
 .vscode/
+
+# OS
+.DS_Store
+
+# runtime
+*.wal
+*.sock
