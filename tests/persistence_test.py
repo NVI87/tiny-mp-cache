@@ -2,10 +2,13 @@
 """
 Восстановление состояния после перезапуска сервера.
 
-Проверяются оба пути восстановления:
+Проверяется:
 - данные, попавшие в snapshot (после него WAL обнуляется) -> восстановление из chunks/*.bin;
-- данные, записанные после snapshot'а -> доигрывание WAL.
+- ключ, записанный между snapshot'ами, переживает следующий snapshot;
+- данные, записанные после snapshot'а -> доигрывание WAL;
+- новые ключи после рестарта не затирают восстановленные.
 """
+import json
 import multiprocessing as mp
 import os
 import tempfile
@@ -44,16 +47,27 @@ def stop_server(p: mp.Process):
     time.sleep(0.2)
 
 
-def wait_for_snapshot(data_dir: str, timeout: float = 5.0):
-    """Ждём, пока появится хотя бы один chunk-файл и WAL будет обнулён."""
-    chunks_dir = os.path.join(data_dir, "chunks")
-    wal_path = os.path.join(data_dir, "wal", "log.bin")
+def current_chunk_id(data_dir: str) -> int:
+    with open(os.path.join(data_dir, "meta", "state.json")) as f:
+        return json.load(f)["current_chunk_id"]
+
+
+def wait_for_snapshots(data_dir: str, n: int = 2, timeout: float = 10.0):
+    """
+    Ждём n смен current_chunk_id: значит, хотя бы один snapshot целиком
+    прошёл после момента вызова (первая смена могла быть у уже идущего snapshot'а).
+    """
+    seen = current_chunk_id(data_dir)
+    changes = 0
     deadline = time.time() + timeout
     while time.time() < deadline:
-        chunks = [f for f in os.listdir(chunks_dir) if f.endswith(".bin")]
-        if chunks and os.path.getsize(wal_path) == 0:
-            return chunks
-        time.sleep(0.1)
+        cur = current_chunk_id(data_dir)
+        if cur != seen:
+            seen = cur
+            changes += 1
+            if changes >= n:
+                return
+        time.sleep(0.05)
     raise AssertionError(f"snapshot was not taken within {timeout}s")
 
 
@@ -71,10 +85,15 @@ def main():
         c1.delete("p:delete")
         assert c1.pop("p:pop") == b"to-pop"
 
-        chunks = wait_for_snapshot(data_dir)
-        print(f"snapshot taken: {chunks}")
+        # первый snapshot: уходят p:keep и т.д., WAL обнуляется
+        wait_for_snapshots(data_dir)
 
-        # --- данные после snapshot'а: живут только в WAL ---
+        # ключ, записанный между snapshot'ами, должен пережить следующий snapshot
+        c1.set("p:mid", b"v-mid")
+        wait_for_snapshots(data_dir)
+        assert c1.get("p:mid") == b"v-mid", "key written after a snapshot was lost by the next one"
+
+        # --- данные после последнего snapshot'а: живут только в WAL ---
         c1.set("p:after", b"v2")
 
         stop_server(p1)
@@ -84,15 +103,22 @@ def main():
         c2 = TinyCache(ADDR)
 
         try:
-            got = {k: c2.get(k) for k in ("p:keep", "p:after", "p:delete", "p:pop")}
+            got = {k: c2.get(k) for k in ("p:keep", "p:mid", "p:after", "p:delete", "p:pop")}
             print(f"after restart: {got}, len={c2.len()}")
 
             assert got["p:keep"] == b"v1", "value from snapshot was not restored"
+            assert got["p:mid"] == b"v-mid", "value from second snapshot was not restored"
             assert got["p:after"] == b"v2", "value from WAL was not restored"
             assert got["p:delete"] is None
             assert got["p:pop"] is None
-            assert sorted(c2.keys("p:*")) == ["p:after", "p:keep"]
-            assert c2.len() == 2
+            assert sorted(c2.keys("p:*")) == ["p:after", "p:keep", "p:mid"]
+            assert c2.len() == 3
+
+            # новые ключи после рестарта не должны затирать восстановленные (key_id)
+            c2.set("p:new", b"v-new")
+            assert c2.get("p:new") == b"v-new"
+            assert c2.get("p:keep") == b"v1", "new key overwrote a restored one"
+            assert c2.get("p:mid") == b"v-mid", "new key overwrote a restored one"
             print("persistence_test: OK")
         finally:
             stop_server(p2)
