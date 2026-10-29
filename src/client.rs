@@ -98,7 +98,7 @@ impl TinyCache {
     fn call(&self, py: Python<'_>, cmd: &CacheCommand) -> PyResult<CacheResponse> {
         let request = protocol::encode_command(cmd).map_err(to_py_err)?;
         match py
-            .allow_threads(|| self.call_blocking(&request))
+            .detach(|| self.call_blocking(&request))
             .map_err(to_py_err)?
         {
             CacheResponse::Err(e) => Err(PyRuntimeError::new_err(e)),
@@ -150,7 +150,7 @@ impl TinyCache {
         retries: Option<u32>,
         retry_delay_ms: Option<u64>,
     ) -> PyResult<Self> {
-        let stream = py.allow_threads(|| connect(&addr)).map_err(to_py_err)?;
+        let stream = py.detach(|| connect(&addr)).map_err(to_py_err)?;
         Ok(TinyCache {
             addr,
             retries: AtomicU32::new(retries.unwrap_or(1)),
@@ -189,7 +189,7 @@ impl TinyCache {
 
     fn get<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
         match self.call(py, &CacheCommand::Get(key.to_string()))? {
-            CacheResponse::Value(v) => Ok(Some(PyBytes::new_bound(py, &v))),
+            CacheResponse::Value(v) => Ok(Some(PyBytes::new(py, &v))),
             CacheResponse::Nil => Ok(None),
             r => Err(unexpected(r)),
         }
@@ -197,7 +197,7 @@ impl TinyCache {
 
     fn pop<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
         match self.call(py, &CacheCommand::Pop(key.to_string()))? {
-            CacheResponse::Value(v) => Ok(Some(PyBytes::new_bound(py, &v))),
+            CacheResponse::Value(v) => Ok(Some(PyBytes::new(py, &v))),
             CacheResponse::Nil => Ok(None),
             r => Err(unexpected(r)),
         }
