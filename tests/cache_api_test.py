@@ -113,6 +113,21 @@ def run_api_tests(addr: str):
     assert "test:ttl_short" not in ttl_keys
     assert "test:ttl_long" in ttl_keys
 
+    print(f"== [{addr}] command size limit ==")
+    big_ok = b"x" * (900 * 1024)
+    c.set("test:big", big_ok)
+    assert c.get("test:big") == big_ok
+    try:
+        c.set("test:too_big", b"x" * (2 * 1024 * 1024))
+    except ValueError as e:
+        print("too big rejected:", e)
+    else:
+        raise AssertionError("value over 1 MiB must be rejected")
+    # отказ на стороне клиента не ломает соединение
+    assert c.get("test:big") == big_ok
+    assert c.get("test:too_big") is None
+    c.delete("test:big")
+
     print(f"ALL API TESTS PASSED for {addr}\n")
 
 

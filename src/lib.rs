@@ -459,6 +459,14 @@ fn handle_connection_impl<S: Read + Write>(
             }
         }
         let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_COMMAND_BYTES {
+            // тело не читаем: сообщаем об ошибке и закрываем соединение
+            let msg = format!("command too large: {} bytes > {}", len, MAX_COMMAND_BYTES);
+            if let Ok(encoded) = bincode::serialize(&CacheResponse::Err(msg.clone())) {
+                let _ = write_all(stream, &frame(&encoded));
+            }
+            return Err(CacheError::Network(msg));
+        }
         let mut buf = vec![0u8; len];
         read_exact(stream, &mut buf)?;
 
@@ -640,6 +648,10 @@ fn read_response(stream: &mut dyn ReadWrite) -> PyResult<CacheResponse> {
         .map_err(|e| PyRuntimeError::new_err(format!("deserialize response: {}", e)))
 }
 
+/// Максимальный размер команды (ключ + значение + служебные байты), как в 0.1.
+/// Защищает сервер от выделения памяти под произвольную длину из заголовка кадра.
+const MAX_COMMAND_BYTES: usize = 1 << 20;
+
 /// Кадр протокола: длина (u32 LE) + тело. Отправляется одним write,
 /// иначе Nagle + delayed ACK дают ~40 мс задержки на каждый запрос (Linux).
 fn frame(data: &[u8]) -> Vec<u8> {
@@ -652,6 +664,13 @@ fn frame(data: &[u8]) -> Vec<u8> {
 fn write_cmd(stream: &mut dyn ReadWrite, cmd: &CacheCommand) -> PyResult<()> {
     let data =
         bincode::serialize(cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
+    if data.len() > MAX_COMMAND_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "command too large: {} bytes > {} (key + value)",
+            data.len(),
+            MAX_COMMAND_BYTES
+        )));
+    }
     stream
         .write_all(&frame(&data))
         .and_then(|_| stream.flush())
