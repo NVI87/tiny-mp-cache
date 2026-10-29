@@ -5,7 +5,7 @@ use crate::meta::{
     StateMeta,
 };
 use crate::wal::{segment_path, Wal, WalRecord};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PySystemExit, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -361,12 +362,6 @@ impl PersistentCore {
     }
 }
 
-impl Drop for PersistentCore {
-    fn drop(&mut self) {
-        // Graceful shutdown: сохраняем состояние перед выходом
-        let _ = self.do_snapshot(now_ms());
-    }
-}
 
 enum WorkerRequest {
     Command(CacheCommand, mpsc::Sender<CacheResponse>),
@@ -507,8 +502,74 @@ fn check_snapshot_config(snapshot_interval_secs: u64, retention_secs: u64) -> Py
     Ok(())
 }
 
+/// Обработчик SIGTERM: SystemExit(0) — serve() делает финальный snapshot и процесс завершается чисто.
+#[pyfunction]
+fn graceful_exit(_signum: i32, _frame: PyObject) -> PyResult<()> {
+    Err(PySystemExit::new_err(0))
+}
+
+/// Ставит graceful_exit на SIGTERM, если у процесса нет своего обработчика
+/// (и мы в главном потоке). Возвращает прежний обработчик для восстановления.
+fn install_sigterm_handler(py: Python<'_>) -> Option<PyObject> {
+    let signal = py.import_bound("signal").ok()?;
+    let sigterm = signal.getattr("SIGTERM").ok()?;
+    let prev = signal.call_method1("getsignal", (sigterm.clone(),)).ok()?;
+    let dfl = signal.getattr("SIG_DFL").ok()?;
+    if !prev.eq(&dfl).unwrap_or(false) {
+        return None;
+    }
+    let handler = wrap_pyfunction!(graceful_exit, py).ok()?;
+    signal.call_method1("signal", (sigterm, handler)).ok()?;
+    Some(prev.unbind())
+}
+
+fn restore_sigterm_handler(py: Python<'_>, prev: Option<PyObject>) {
+    let Some(prev) = prev else { return };
+    if let Ok(signal) = py.import_bound("signal") {
+        if let Ok(sigterm) = signal.getattr("SIGTERM") {
+            let _ = signal.call_method1("signal", (sigterm, prev));
+        }
+    }
+}
+
+/// Соединения принимает фоновый поток `accept_loop`, а главный поток отпускает GIL
+/// и раз в 100 мс проверяет сигналы Python. По сигналу (Ctrl+C, SIGTERM) делается
+/// финальный snapshot, и исключение сигнала возвращается в Python.
+fn run_until_signal(
+    py: Python<'_>,
+    persistent: Arc<PersistentCore>,
+    accept_loop: impl FnOnce() + Send + 'static,
+) -> PyResult<()> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    {
+        let stopped = Arc::clone(&stopped);
+        thread::spawn(move || {
+            accept_loop();
+            stopped.store(true, Ordering::SeqCst);
+        });
+    }
+
+    let prev_handler = install_sigterm_handler(py);
+    let result = loop {
+        py.allow_threads(|| thread::sleep(Duration::from_millis(100)));
+        if let Err(e) = py.check_signals() {
+            break Err(e);
+        }
+        if stopped.load(Ordering::SeqCst) {
+            break Ok(());
+        }
+    };
+
+    if let Err(e) = py.allow_threads(|| persistent.do_snapshot(now_ms())) {
+        eprintln!("final snapshot error: {:?}", e);
+    }
+    restore_sigterm_handler(py, prev_handler);
+    result
+}
+
 #[pyfunction(signature = (data_dir, port=5002, snapshot_interval_secs=60, retention_secs=600))]
 fn serve(
+    py: Python<'_>,
     data_dir: String,
     port: u16,
     snapshot_interval_secs: u64,
@@ -525,37 +586,38 @@ fn serve(
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 
-    let server_core = Arc::new(ServerCore::new(persistent));
+    let server_core = Arc::new(ServerCore::new(Arc::clone(&persistent)));
 
     let listener = TcpListener::bind(&addr)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind error: {}", e)))?;
 
     println!("TinyCache TCP ready: {}", addr);
 
-    for stream_res in listener.incoming() {
-        match stream_res {
-            Ok(mut stream) => {
-                stream.set_nodelay(true).ok();
-                let server_clone = server_core.clone();
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection(&mut stream, server_clone) {
-                        eprintln!("TCP connection error: {:?}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("TCP listener error: {}", e);
-                break;
+    run_until_signal(py, persistent, move || {
+        for stream_res in listener.incoming() {
+            match stream_res {
+                Ok(mut stream) => {
+                    stream.set_nodelay(true).ok();
+                    let server_clone = server_core.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = handle_connection(&mut stream, server_clone) {
+                            eprintln!("TCP connection error: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("TCP listener error: {}", e);
+                    break;
+                }
             }
         }
-    }
-
-    Ok(())
+    })
 }
 
 #[cfg(unix)]
 #[pyfunction(signature = (data_dir, snapshot_interval_secs=60, retention_secs=600))]
 fn serve_unix(
+    py: Python<'_>,
     data_dir: String,
     snapshot_interval_secs: u64,
     retention_secs: u64,
@@ -578,31 +640,31 @@ fn serve_unix(
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 
-    let server_core = Arc::new(ServerCore::new(persistent));
+    let server_core = Arc::new(ServerCore::new(Arc::clone(&persistent)));
 
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind UDS error: {}", e)))?;
 
     println!("TinyCache UDS ready: {:?}", sock_path);
 
-    for stream_res in listener.incoming() {
-        match stream_res {
-            Ok(mut stream) => {
-                let server_clone = server_core.clone();
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection_unix(&mut stream, server_clone) {
-                        eprintln!("UDS connection error: {:?}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("UDS listener error: {}", e);
-                break;
+    run_until_signal(py, persistent, move || {
+        for stream_res in listener.incoming() {
+            match stream_res {
+                Ok(mut stream) => {
+                    let server_clone = server_core.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = handle_connection_unix(&mut stream, server_clone) {
+                            eprintln!("UDS connection error: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("UDS listener error: {}", e);
+                    break;
+                }
             }
         }
-    }
-
-    Ok(())
+    })
 }
 
 trait ReadWrite: Read + Write + Send {}

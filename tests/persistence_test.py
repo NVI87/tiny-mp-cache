@@ -11,6 +11,7 @@
 import json
 import multiprocessing as mp
 import os
+import signal
 import tempfile
 import time
 
@@ -43,6 +44,13 @@ def start_server(data_dir: str) -> mp.Process:
 
 def stop_server(p: mp.Process):
     p.terminate()
+    p.join(timeout=2)
+    time.sleep(0.2)
+
+
+def kill_server(p: mp.Process):
+    # SIGKILL без финального snapshot'а: p:after остаётся только в WAL
+    os.kill(p.pid, signal.SIGKILL)
     p.join(timeout=2)
     time.sleep(0.2)
 
@@ -96,7 +104,7 @@ def main():
         # --- данные после последнего snapshot'а: живут только в WAL ---
         c1.set("p:after", b"v2")
 
-        stop_server(p1)
+        kill_server(p1)
 
         # --- второй запуск: проверяем восстановление ---
         p2 = start_server(data_dir)
