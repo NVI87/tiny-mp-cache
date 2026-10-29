@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ pub struct KeyMeta {
 pub struct CacheCore {
     pub(crate) meta_by_key: Arc<DashMap<String, KeyMeta>>,
     pub(crate) values: Arc<DashMap<KeyId, Vec<u8>>>,
-    next_key_id: Arc<parking_lot::Mutex<KeyId>>,
+    next_key_id: Arc<AtomicU64>,
 }
 
 impl Default for CacheCore {
@@ -26,7 +27,7 @@ impl Default for CacheCore {
         Self {
             meta_by_key: Arc::new(DashMap::new()),
             values: Arc::new(DashMap::new()),
-            next_key_id: Arc::new(parking_lot::Mutex::new(1)),
+            next_key_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -37,10 +38,7 @@ impl CacheCore {
     }
 
     fn gen_key_id(&self) -> KeyId {
-        let mut guard = self.next_key_id.lock();
-        let id = *guard;
-        *guard = id.wrapping_add(1);
-        id
+        self.next_key_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn insert_meta_only(&self, key: String, meta: KeyMeta) {
@@ -56,10 +54,7 @@ impl CacheCore {
             .map(|e| e.key_id)
             .max()
             .unwrap_or(0);
-        let mut guard = self.next_key_id.lock();
-        if *guard <= max {
-            *guard = max + 1;
-        }
+        self.next_key_id.fetch_max(max + 1, Ordering::Relaxed);
     }
 
     /// key_id -> chunk_id по текущей мете (для загрузки значений из chunk-файлов).
@@ -148,136 +143,113 @@ impl CacheCore {
         out
     }
 
-    /// Жёсткая очистка по TTL и по "неживым" chunk_id.
+    /// Очистка по TTL и по "неживым" chunk_id (вызывается при snapshot'е).
     /// Текущий (ещё не сохранённый в snapshot) чанк всегда считается живым.
+    /// Удаляем через remove_if по key_id: ключ, перезаписанный параллельно, не трогаем.
     pub fn gc(&self, live_chunks: &[ChunkId], current_chunk_id: ChunkId) {
         let now = Instant::now();
-        let mut live: std::collections::HashSet<ChunkId> = live_chunks.iter().cloned().collect();
+        let mut live: HashSet<ChunkId> = live_chunks.iter().cloned().collect();
         live.insert(current_chunk_id);
-        let mut to_delete = Vec::new();
 
-        for entry in self.meta_by_key.iter() {
-            let mut dead = false;
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    dead = true;
-                }
-            }
-            if !dead && !live.contains(&entry.chunk_id) {
-                dead = true;
-            }
-            if dead {
-                to_delete.push((entry.key().clone(), entry.key_id));
-            }
-        }
+        let to_delete: Vec<(String, KeyId)> = self
+            .meta_by_key
+            .iter()
+            .filter(|e| is_expired(e.value(), now) || !live.contains(&e.chunk_id))
+            .map(|e| (e.key().clone(), e.key_id))
+            .collect();
 
         for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
+            if self.meta_by_key.remove_if(&k, |_, m| m.key_id == id).is_some() {
+                self.values.remove(&id);
+            }
         }
     }
 
-    pub fn get_meta(&self, key: &str) -> Option<KeyMeta> {
-        let entry = self.meta_by_key.get(key)?;
-        if let Some(ttl) = entry.ttl {
-            if Instant::now() >= ttl {
-                let key_id = entry.key_id;
-                let key_str = entry.key().clone();
-                drop(entry);
-                self.meta_by_key.remove(&key_str);
-                self.values.remove(&key_id);
-                return None;
-            }
+    /// Мета живого ключа (без истёкшего TTL). Ничего не удаляет: это делает gc.
+    fn live_meta(&self, key: &str) -> Option<KeyMeta> {
+        let meta = self.meta_by_key.get(key)?.clone();
+        if is_expired(&meta, Instant::now()) {
+            return None;
         }
-        Some(entry.clone())
+        Some(meta)
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let meta = self.get_meta(key)?;
-        self.values.get(&meta.key_id).map(|v| v.clone())
-    }
-
-    /// set/update с учётом текущего chunk_id.
-    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>, chunk_id: ChunkId) {
-        let now = Instant::now();
-        let expires_at = ttl.map(|d| now + d);
-
-        let key_id = if let Some(existing) = self.meta_by_key.get(&key) {
-            existing.key_id
-        } else {
-            self.gen_key_id()
-        };
-
-        let meta = KeyMeta {
-            key_id,
-            chunk_id,
-            ttl: expires_at,
-            updated_at: now,
-        };
-
-        self.meta_by_key.insert(key, meta);
-        self.values.insert(key_id, value);
-    }
-
-    pub fn pop(&self, key: &str) -> Option<Vec<u8>> {
-        if let Some(meta) = self.get_meta(key) {
-            self.meta_by_key.remove(key);
-            self.values.remove(&meta.key_id).map(|(_, v)| v)
-        } else {
-            None
+        loop {
+            let meta = self.live_meta(key)?;
+            if let Some(v) = self.values.get(&meta.key_id) {
+                return Some(v.clone());
+            }
+            // значение по старому key_id уже убрал параллельный set/delete:
+            // перечитываем мету, пока она не перестанет меняться
+            match self.meta_by_key.get(key) {
+                Some(m) if m.key_id != meta.key_id => continue,
+                _ => return None,
+            }
         }
     }
 
+    /// set/update с учётом текущего chunk_id.
+    /// Каждый set получает новый key_id: значение пишется до меты, старое удаляется после,
+    /// поэтому параллельные чтение и gc никогда не видят и не удаляют чужое значение.
+    pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>, chunk_id: ChunkId) {
+        let now = Instant::now();
+        let key_id = self.gen_key_id();
+        let meta = KeyMeta {
+            key_id,
+            chunk_id,
+            ttl: ttl.map(|d| now + d),
+            updated_at: now,
+        };
+
+        self.values.insert(key_id, value);
+        if let Some(old) = self.meta_by_key.insert(key, meta) {
+            self.values.remove(&old.key_id);
+        }
+    }
+
+    /// Атомарно: при конкурентных pop одного ключа значение получает ровно один вызов.
+    pub fn pop(&self, key: &str) -> Option<Vec<u8>> {
+        let (_, meta) = self.meta_by_key.remove(key)?;
+        let value = self.values.remove(&meta.key_id).map(|(_, v)| v);
+        if is_expired(&meta, Instant::now()) {
+            return None;
+        }
+        value
+    }
+
     pub fn delete(&self, key: &str) -> i64 {
-        if let Some((_, meta)) = self.meta_by_key.remove(key) {
-            self.values.remove(&meta.key_id);
-            1
-        } else {
-            0
+        match self.meta_by_key.remove(key) {
+            Some((_, meta)) => {
+                self.values.remove(&meta.key_id);
+                if is_expired(&meta, Instant::now()) {
+                    0
+                } else {
+                    1
+                }
+            }
+            None => 0,
         }
     }
 
     pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
         let now = Instant::now();
-        let mut res = Vec::new();
-        let mut to_delete = Vec::new();
-
-        for entry in self.meta_by_key.iter() {
-            if !entry.key().starts_with(prefix) {
-                continue;
-            }
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    to_delete.push((entry.key().clone(), entry.key_id));
-                    continue;
-                }
-            }
-            res.push(entry.key().clone());
-        }
-
-        for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
-        }
-
-        res
+        self.meta_by_key
+            .iter()
+            .filter(|e| e.key().starts_with(prefix) && !is_expired(e.value(), now))
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     pub fn len(&self) -> i64 {
         let now = Instant::now();
-        let mut to_delete = Vec::new();
-        for entry in self.meta_by_key.iter() {
-            if let Some(ttl) = entry.ttl {
-                if now >= ttl {
-                    to_delete.push((entry.key().clone(), entry.key_id));
-                }
-            }
-        }
-        for (k, id) in to_delete {
-            self.meta_by_key.remove(&k);
-            self.values.remove(&id);
-        }
-
-        self.meta_by_key.len() as i64
+        self.meta_by_key
+            .iter()
+            .filter(|e| !is_expired(e.value(), now))
+            .count() as i64
     }
+}
+
+fn is_expired(meta: &KeyMeta, now: Instant) -> bool {
+    matches!(meta.ttl, Some(t) if now >= t)
 }

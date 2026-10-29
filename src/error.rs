@@ -10,4 +10,8 @@ pub enum CacheError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Команда больше protocol::MAX_COMMAND_BYTES.
+    #[error("{0}")]
+    TooLarge(String),
 }
