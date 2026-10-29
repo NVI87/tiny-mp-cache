@@ -4,48 +4,29 @@ use crate::meta::{
     load_chunks, load_keys_meta, load_or_init_state, save_keys_meta, save_state, Paths,
     StateMeta,
 };
+use crate::protocol::{CacheCommand, CacheResponse, HEADER_BYTES, MAX_COMMAND_BYTES};
 use crate::wal::{segment_path, Wal, WalRecord};
 use pyo3::exceptions::{PyRuntimeError, PySystemExit, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
+mod client;
 mod core;
 mod error;
 mod meta;
+mod protocol;
 mod wal;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-enum CacheCommand {
-    Set(String, Vec<u8>, i64),
-    Get(String),
-    Pop(String),
-    Del(String),
-    Keys(String),
-    Len,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum CacheResponse {
-    Ok,
-    Value(Vec<u8>),
-    Int(i64),
-    Keys(Vec<String>),
-    Nil,
-    Err(String),
-}
 
 fn read_exact(stream: &mut impl Read, buf: &mut [u8]) -> Result<(), CacheError> {
     stream
@@ -363,88 +344,46 @@ impl PersistentCore {
 }
 
 
-enum WorkerRequest {
-    Command(CacheCommand, mpsc::Sender<CacheResponse>),
-}
-
-struct ServerCore {
-    tx: mpsc::Sender<WorkerRequest>,
-}
-
-impl ServerCore {
-    fn new(persistent: Arc<PersistentCore>) -> Self {
-        let (tx, rx) = mpsc::channel::<WorkerRequest>();
-
-        thread::spawn(move || {
-            while let Ok(WorkerRequest::Command(cmd, resp_tx)) = rx.recv() {
-                let resp = match cmd {
-                    CacheCommand::Set(key, value, ttl_ms) => {
-                        let ttl = if ttl_ms < 0 {
-                            None
-                        } else {
-                            Some(Duration::from_millis(ttl_ms as u64))
-                        };
-                        match persistent.set(key, value, ttl) {
-                            Ok(()) => CacheResponse::Ok,
-                            Err(e) => CacheResponse::Err(e.to_string()),
-                        }
-                    }
-                    CacheCommand::Get(key) => match persistent.get(&key) {
-                        Ok(Some(v)) => CacheResponse::Value(v),
-                        Ok(None) => CacheResponse::Nil,
-                        Err(e) => CacheResponse::Err(e.to_string()),
-                    },
-                    CacheCommand::Pop(key) => match persistent.pop(&key) {
-                        Ok(Some(v)) => CacheResponse::Value(v),
-                        Ok(None) => CacheResponse::Nil,
-                        Err(e) => CacheResponse::Err(e.to_string()),
-                    },
-                    CacheCommand::Del(key) => match persistent.delete(&key) {
-                        Ok(n) => CacheResponse::Int(n),
-                        Err(e) => CacheResponse::Err(e.to_string()),
-                    },
-                    CacheCommand::Keys(pattern) => {
-                        if pattern.ends_with('*') {
-                            let prefix = &pattern[..pattern.len() - 1];
-                            match persistent.keys_prefix(prefix) {
-                                Ok(keys) => CacheResponse::Keys(keys),
-                                Err(e) => CacheResponse::Err(e.to_string()),
-                            }
-                        } else {
-                            CacheResponse::Keys(Vec::new())
-                        }
-                    }
-                    CacheCommand::Len => match persistent.len() {
-                        Ok(n) => CacheResponse::Int(n),
-                        Err(e) => CacheResponse::Err(e.to_string()),
-                    },
-                };
-
-                let _ = resp_tx.send(resp);
-            }
-        });
-
-        ServerCore { tx }
+/// Выполнить команду. Вызывается параллельно из потоков соединений:
+/// изменения упорядочены блокировкой WAL, чтение идёт без блокировок.
+fn execute(core: &PersistentCore, cmd: CacheCommand) -> CacheResponse {
+    fn or_err<T>(r: Result<T, CacheError>, ok: impl FnOnce(T) -> CacheResponse) -> CacheResponse {
+        match r {
+            Ok(v) => ok(v),
+            Err(e) => CacheResponse::Err(e.to_string()),
+        }
+    }
+    fn value(v: Option<Vec<u8>>) -> CacheResponse {
+        v.map(CacheResponse::Value).unwrap_or(CacheResponse::Nil)
     }
 
-    fn execute(&self, cmd: CacheCommand) -> Result<CacheResponse, CacheError> {
-        let (resp_tx, resp_rx) = mpsc::channel();
-        self.tx
-            .send(WorkerRequest::Command(cmd, resp_tx))
-            .map_err(|e| CacheError::Internal(format!("worker send: {}", e)))?;
-        resp_rx
-            .recv()
-            .map_err(|e| CacheError::Internal(format!("worker recv: {}", e)))
+    match cmd {
+        CacheCommand::Set(key, val, ttl_ms) => {
+            let ttl = if ttl_ms < 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ttl_ms as u64))
+            };
+            or_err(core.set(key, val, ttl), |()| CacheResponse::Ok)
+        }
+        CacheCommand::Get(key) => or_err(core.get(&key), value),
+        CacheCommand::Pop(key) => or_err(core.pop(&key), value),
+        CacheCommand::Del(key) => or_err(core.delete(&key), CacheResponse::Int),
+        CacheCommand::Keys(pattern) => match pattern.strip_suffix('*') {
+            Some(prefix) => or_err(core.keys_prefix(prefix), CacheResponse::Keys),
+            None => CacheResponse::Keys(Vec::new()),
+        },
+        CacheCommand::Len => or_err(core.len(), CacheResponse::Int),
     }
 }
 
 fn handle_connection_impl<S: Read + Write>(
     stream: &mut S,
-    server: Arc<ServerCore>,
+    core: Arc<PersistentCore>,
 ) -> Result<(), CacheError> {
     loop {
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf) {
+        let mut header = [0u8; HEADER_BYTES];
+        match stream.read_exact(&mut header) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Ok(());
@@ -453,39 +392,34 @@ fn handle_connection_impl<S: Read + Write>(
                 return Err(CacheError::Network(format!("read cmd len: {}", e)));
             }
         }
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = protocol::body_len(header);
         if len > MAX_COMMAND_BYTES {
             // тело не читаем: сообщаем об ошибке и закрываем соединение
             let msg = format!("command too large: {} bytes > {}", len, MAX_COMMAND_BYTES);
-            if let Ok(encoded) = bincode::serialize(&CacheResponse::Err(msg.clone())) {
-                let _ = write_all(stream, &frame(&encoded));
+            if let Ok(resp) = protocol::encode_response(&CacheResponse::Err(msg.clone())) {
+                let _ = write_all(stream, &resp);
             }
             return Err(CacheError::Network(msg));
         }
         let mut buf = vec![0u8; len];
         read_exact(stream, &mut buf)?;
 
-        let cmd: CacheCommand =
-            bincode::deserialize(&buf).map_err(|e| CacheError::Serialization(e.to_string()))?;
-
-        let resp = server.execute(cmd)?;
-
-        let encoded =
-            bincode::serialize(&resp).map_err(|e| CacheError::Serialization(e.to_string()))?;
-        write_all(stream, &frame(&encoded))?;
+        let cmd = protocol::decode_command(&buf)?;
+        let resp = execute(&core, cmd);
+        write_all(stream, &protocol::encode_response(&resp)?)?;
     }
 }
 
-fn handle_connection(stream: &mut TcpStream, server: Arc<ServerCore>) -> Result<(), CacheError> {
-    handle_connection_impl(stream, server)
+fn handle_connection(stream: &mut TcpStream, core: Arc<PersistentCore>) -> Result<(), CacheError> {
+    handle_connection_impl(stream, core)
 }
 
 #[cfg(unix)]
 fn handle_connection_unix(
     stream: &mut UnixStream,
-    server: Arc<ServerCore>,
+    core: Arc<PersistentCore>,
 ) -> Result<(), CacheError> {
-    handle_connection_impl(stream, server)
+    handle_connection_impl(stream, core)
 }
 
 /// snapshot_interval_secs > 0, retention_secs >= snapshot_interval_secs
@@ -586,7 +520,7 @@ fn serve(
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 
-    let server_core = Arc::new(ServerCore::new(Arc::clone(&persistent)));
+    let server_core = Arc::clone(&persistent);
 
     let listener = TcpListener::bind(&addr)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind error: {}", e)))?;
@@ -640,7 +574,7 @@ fn serve_unix(
     )
     .map_err(|e| PyRuntimeError::new_err(format!("init persistent core: {}", e)))?;
 
-    let server_core = Arc::new(ServerCore::new(Arc::clone(&persistent)));
+    let server_core = Arc::clone(&persistent);
 
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Bind UDS error: {}", e)))?;
@@ -667,330 +601,9 @@ fn serve_unix(
     })
 }
 
-trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
-
-fn connect(addr: &str) -> PyResult<Box<dyn ReadWrite>> {
-    if let Some(path) = addr.strip_prefix("unix://") {
-        #[cfg(unix)]
-        {
-            let stream = UnixStream::connect(path)
-                .map_err(|e| PyRuntimeError::new_err(format!("connect unix: {}", e)))?;
-            Ok(Box::new(stream))
-        }
-        #[cfg(not(unix))]
-        {
-            Err(PyRuntimeError::new_err("Unix sockets not supported"))
-        }
-    } else {
-        let addr = if let Some(a) = addr.strip_prefix("tcp://") {
-            a
-        } else {
-            addr
-        };
-        let stream = TcpStream::connect(addr)
-            .map_err(|e| PyRuntimeError::new_err(format!("connect tcp: {}", e)))?;
-        stream.set_nodelay(true).ok();
-        Ok(Box::new(stream))
-    }
-}
-
-fn read_response(stream: &mut dyn ReadWrite) -> PyResult<CacheResponse> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| PyRuntimeError::new_err(format!("read response len: {}", e)))?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .map_err(|e| PyRuntimeError::new_err(format!("read response body: {}", e)))?;
-
-    bincode::deserialize(&buf)
-        .map_err(|e| PyRuntimeError::new_err(format!("deserialize response: {}", e)))
-}
-
-/// Максимальный размер команды (ключ + значение + служебные байты), как в 0.1.
-/// Защищает сервер от выделения памяти под произвольную длину из заголовка кадра.
-const MAX_COMMAND_BYTES: usize = 1 << 20;
-
-/// Кадр протокола: длина (u32 LE) + тело. Отправляется одним write,
-/// иначе Nagle + delayed ACK дают ~40 мс задержки на каждый запрос (Linux).
-fn frame(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + data.len());
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(data);
-    out
-}
-
-fn write_cmd(stream: &mut dyn ReadWrite, cmd: &CacheCommand) -> PyResult<()> {
-    let data =
-        bincode::serialize(cmd).map_err(|e| PyRuntimeError::new_err(format!("serialize cmd: {}", e)))?;
-    if data.len() > MAX_COMMAND_BYTES {
-        return Err(PyValueError::new_err(format!(
-            "command too large: {} bytes > {} (key + value)",
-            data.len(),
-            MAX_COMMAND_BYTES
-        )));
-    }
-    stream
-        .write_all(&frame(&data))
-        .and_then(|_| stream.flush())
-        .map_err(|e| PyRuntimeError::new_err(format!("write cmd: {}", e)))
-}
-
-fn send_cmd(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<()> {
-    write_cmd(stream, &cmd)?;
-
-    match read_response(stream)? {
-        CacheResponse::Ok => Ok(()),
-        CacheResponse::Err(e) => Err(PyRuntimeError::new_err(e)),
-        r => Err(PyRuntimeError::new_err(format!("unexpected response: {:?}", r))),
-    }
-}
-
-fn send_cmd_expect_value(
-    stream: &mut dyn ReadWrite,
-    cmd: CacheCommand,
-) -> PyResult<Option<Vec<u8>>> {
-    write_cmd(stream, &cmd)?;
-
-    match read_response(stream)? {
-        CacheResponse::Value(v) => Ok(Some(v)),
-        CacheResponse::Nil => Ok(None),
-        CacheResponse::Err(e) => Err(PyRuntimeError::new_err(e)),
-        r => Err(PyRuntimeError::new_err(format!("unexpected response: {:?}", r))),
-    }
-}
-
-fn send_cmd_expect_int(stream: &mut dyn ReadWrite, cmd: CacheCommand) -> PyResult<i64> {
-    write_cmd(stream, &cmd)?;
-
-    match read_response(stream)? {
-        CacheResponse::Int(n) => Ok(n),
-        CacheResponse::Err(e) => Err(PyRuntimeError::new_err(e)),
-        r => Err(PyRuntimeError::new_err(format!("unexpected response: {:?}", r))),
-    }
-}
-
-fn send_cmd_expect_keys(
-    stream: &mut dyn ReadWrite,
-    cmd: CacheCommand,
-) -> PyResult<Vec<String>> {
-    write_cmd(stream, &cmd)?;
-
-    match read_response(stream)? {
-        CacheResponse::Keys(k) => Ok(k),
-        CacheResponse::Err(e) => Err(PyRuntimeError::new_err(e)),
-        r => Err(PyRuntimeError::new_err(format!("unexpected response: {:?}", r))),
-    }
-}
-
-#[pyclass]
-struct TinyCache {
-    addr: String,
-    retries: u32,
-    retry_delay: Duration,
-    stream: Arc<Mutex<Box<dyn ReadWrite>>>,
-}
-
-#[pymethods]
-impl TinyCache {
-    #[new]
-    #[pyo3(signature = (addr, retries=None, retry_delay_ms=None))]
-    fn new(
-        addr: String,
-        retries: Option<u32>,
-        retry_delay_ms: Option<u64>,
-    ) -> PyResult<Self> {
-        let retries = retries.unwrap_or(1);
-        let retry_delay = Duration::from_millis(retry_delay_ms.unwrap_or(100));
-        let stream = connect(&addr)?;
-        Ok(TinyCache {
-            addr,
-            retries,
-            retry_delay,
-            stream: Arc::new(Mutex::new(stream)),
-        })
-    }
-
-    fn set_retries(&mut self, retries: u32) {
-        self.retries = retries;
-    }
-
-    fn set_retry_delay_ms(&mut self, ms: u64) {
-        self.retry_delay = Duration::from_millis(ms);
-    }
-
-    #[pyo3(signature = (key, value, ttl=None))]
-    fn set(&self, _py: Python<'_>, key: &str, value: &[u8], ttl: Option<f64>) -> PyResult<()> {
-        let ttl_ms = ttl.map(|s| (s * 1000.0) as i64).unwrap_or(-1);
-        let cmd = CacheCommand::Set(key.to_string(), value.to_vec(), ttl_ms);
-        self._with_retry_ok(cmd)
-    }
-
-    fn get<'py>(
-        &self,
-        py: Python<'py>,
-        key: &str,
-    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let cmd = CacheCommand::Get(key.to_string());
-        match self._with_retry_value(cmd)? {
-            Some(v) => {
-                let b = PyBytes::new_bound(py, &v);
-                Ok(Some(b))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn pop<'py>(
-        &self,
-        py: Python<'py>,
-        key: &str,
-    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let cmd = CacheCommand::Pop(key.to_string());
-        match self._with_retry_value(cmd)? {
-            Some(v) => {
-                let b = PyBytes::new_bound(py, &v);
-                Ok(Some(b))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn delete(&self, _py: Python<'_>, key: &str) -> PyResult<i64> {
-        let cmd = CacheCommand::Del(key.to_string());
-        self._with_retry_int(cmd)
-    }
-
-    fn keys(&self, _py: Python<'_>, pattern: &str) -> PyResult<Vec<String>> {
-        let cmd = CacheCommand::Keys(pattern.to_string());
-        self._with_retry_keys(cmd)
-    }
-
-    fn len(&self, _py: Python<'_>) -> PyResult<i64> {
-        let cmd = CacheCommand::Len;
-        self._with_retry_int(cmd)
-    }
-}
-
-impl TinyCache {
-    fn _reconnect(&self) -> PyResult<()> {
-        let new_stream = connect(&self.addr)?;
-        let mut guard = self.stream.lock().unwrap();
-        *guard = new_stream;
-        Ok(())
-    }
-
-    fn _with_retry_value(&self, cmd: CacheCommand) -> PyResult<Option<Vec<u8>>> {
-        let attempts = self.retries.max(1);
-        let mut last_err: Option<PyErr> = None;
-
-        for attempt in 0..attempts {
-            {
-                let mut guard = self.stream.lock().unwrap();
-                match send_cmd_expect_value(&mut **guard, cmd.clone()) {
-                    Ok(v) => return Ok(v),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if attempt + 1 < attempts {
-                if let Err(e) = self._reconnect() {
-                    last_err = Some(e);
-                    break;
-                }
-                thread::sleep(self.retry_delay);
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            PyRuntimeError::new_err("operation failed without specific error")
-        }))
-    }
-
-    fn _with_retry_int(&self, cmd: CacheCommand) -> PyResult<i64> {
-        let attempts = self.retries.max(1);
-        let mut last_err: Option<PyErr> = None;
-
-        for attempt in 0..attempts {
-            {
-                let mut guard = self.stream.lock().unwrap();
-                match send_cmd_expect_int(&mut **guard, cmd.clone()) {
-                    Ok(v) => return Ok(v),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if attempt + 1 < attempts {
-                if let Err(e) = self._reconnect() {
-                    last_err = Some(e);
-                    break;
-                }
-                thread::sleep(self.retry_delay);
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            PyRuntimeError::new_err("operation failed without specific error")
-        }))
-    }
-
-    fn _with_retry_keys(&self, cmd: CacheCommand) -> PyResult<Vec<String>> {
-        let attempts = self.retries.max(1);
-        let mut last_err: Option<PyErr> = None;
-
-        for attempt in 0..attempts {
-            {
-                let mut guard = self.stream.lock().unwrap();
-                match send_cmd_expect_keys(&mut **guard, cmd.clone()) {
-                    Ok(v) => return Ok(v),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if attempt + 1 < attempts {
-                if let Err(e) = self._reconnect() {
-                    last_err = Some(e);
-                    break;
-                }
-                thread::sleep(self.retry_delay);
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            PyRuntimeError::new_err("operation failed without specific error")
-        }))
-    }
-
-    fn _with_retry_ok(&self, cmd: CacheCommand) -> PyResult<()> {
-        let attempts = self.retries.max(1);
-        let mut last_err: Option<PyErr> = None;
-
-        for attempt in 0..attempts {
-            {
-                let mut guard = self.stream.lock().unwrap();
-                match send_cmd(&mut **guard, cmd.clone()) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if attempt + 1 < attempts {
-                if let Err(e) = self._reconnect() {
-                    last_err = Some(e);
-                    break;
-                }
-                thread::sleep(self.retry_delay);
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            PyRuntimeError::new_err("operation failed without specific error")
-        }))
-    }
-}
-
 #[pymodule]
 fn tiny_mp_cache(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<TinyCache>()?;
+    m.add_class::<client::TinyCache>()?;
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     #[cfg(unix)]
     m.add_function(wrap_pyfunction!(serve_unix, m)?)?;
