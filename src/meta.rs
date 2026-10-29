@@ -243,3 +243,78 @@ pub fn save_keys_meta(paths: &Paths, core: &CacheCore) -> Result<(), CacheError>
         .map_err(|e| CacheError::Internal(format!("rename keys.tmp: {}", e)))?;
     Ok(())
 }
+
+const CHUNK_MAGIC: &[u8; 4] = b"TMCK";
+const CHUNK_VERSION: u32 = 1;
+
+fn take<'a>(r: &mut &'a [u8], n: usize, path: &Path) -> Result<&'a [u8], CacheError> {
+    if r.len() < n {
+        return Err(CacheError::Internal(format!(
+            "chunk file truncated: {}",
+            path.display()
+        )));
+    }
+    let (head, tail) = r.split_at(n);
+    *r = tail;
+    Ok(head)
+}
+
+/// Загрузить значения из chunk-файлов живых чанков (формат пишет do_snapshot).
+/// Значение берётся, только если мета ключа указывает на этот же чанк:
+/// более старые чанки могут хранить устаревшую версию того же key_id.
+pub fn load_chunks(
+    paths: &Paths,
+    core: &CacheCore,
+    live_chunks: &[ChunkId],
+) -> Result<(), CacheError> {
+    let owner = core.chunk_by_key_id();
+
+    for &chunk_id in live_chunks {
+        let path = paths.chunk_file(chunk_id);
+        if !path.exists() {
+            continue;
+        }
+
+        let mut buf = Vec::new();
+        File::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut buf))
+            .map_err(|e| CacheError::Internal(format!("read {}: {}", path.display(), e)))?;
+        let mut r = &buf[..];
+
+        if take(&mut r, 4, &path)? != CHUNK_MAGIC {
+            return Err(CacheError::Internal(format!(
+                "bad chunk magic: {}",
+                path.display()
+            )));
+        }
+        let version = u32::from_le_bytes(take(&mut r, 4, &path)?.try_into().unwrap());
+        if version != CHUNK_VERSION {
+            return Err(CacheError::Internal(format!(
+                "unsupported chunk version {}: {}",
+                version,
+                path.display()
+            )));
+        }
+        let file_chunk_id = u64::from_le_bytes(take(&mut r, 8, &path)?.try_into().unwrap());
+        if file_chunk_id != chunk_id {
+            return Err(CacheError::Internal(format!(
+                "chunk id mismatch ({} != {}): {}",
+                file_chunk_id,
+                chunk_id,
+                path.display()
+            )));
+        }
+        let count = u64::from_le_bytes(take(&mut r, 8, &path)?.try_into().unwrap());
+
+        for _ in 0..count {
+            let key_id = u64::from_le_bytes(take(&mut r, 8, &path)?.try_into().unwrap());
+            let len = u32::from_le_bytes(take(&mut r, 4, &path)?.try_into().unwrap()) as usize;
+            let value = take(&mut r, len, &path)?;
+            if owner.get(&key_id) == Some(&chunk_id) {
+                core.insert_value(key_id, value.to_vec());
+            }
+        }
+    }
+
+    Ok(())
+}

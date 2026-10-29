@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,47 @@ impl CacheCore {
 
     pub fn insert_meta_only(&self, key: String, meta: KeyMeta) {
         self.meta_by_key.insert(key, meta);
+    }
+
+    /// После загрузки меты с диска: продолжаем нумерацию key_id после максимального,
+    /// иначе новые ключи получат key_id уже существующих и затрут их значения.
+    pub fn bump_next_key_id(&self) {
+        let max = self
+            .meta_by_key
+            .iter()
+            .map(|e| e.key_id)
+            .max()
+            .unwrap_or(0);
+        let mut guard = self.next_key_id.lock();
+        if *guard <= max {
+            *guard = max + 1;
+        }
+    }
+
+    /// key_id -> chunk_id по текущей мете (для загрузки значений из chunk-файлов).
+    pub fn chunk_by_key_id(&self) -> HashMap<KeyId, ChunkId> {
+        self.meta_by_key
+            .iter()
+            .map(|e| (e.key_id, e.chunk_id))
+            .collect()
+    }
+
+    pub fn insert_value(&self, key_id: KeyId, value: Vec<u8>) {
+        self.values.insert(key_id, value);
+    }
+
+    /// Удалить мету ключей, для которых не нашлось значения. Возвращает число удалённых.
+    pub fn drop_meta_without_values(&self) -> usize {
+        let orphans: Vec<String> = self
+            .meta_by_key
+            .iter()
+            .filter(|e| !self.values.contains_key(&e.key_id))
+            .map(|e| e.key().clone())
+            .collect();
+        for k in &orphans {
+            self.meta_by_key.remove(k);
+        }
+        orphans.len()
     }
 
     /// Экспорт меты для keys.bin: (cache_key, key_id, chunk_id, ttl, updated_at).
@@ -94,9 +136,11 @@ impl CacheCore {
     }
 
     /// Жёсткая очистка по TTL и по "неживым" chunk_id.
-    pub fn gc(&self, live_chunks: &[ChunkId]) {
+    /// Текущий (ещё не сохранённый в snapshot) чанк всегда считается живым.
+    pub fn gc(&self, live_chunks: &[ChunkId], current_chunk_id: ChunkId) {
         let now = Instant::now();
-        let live: std::collections::HashSet<ChunkId> = live_chunks.iter().cloned().collect();
+        let mut live: std::collections::HashSet<ChunkId> = live_chunks.iter().cloned().collect();
+        live.insert(current_chunk_id);
         let mut to_delete = Vec::new();
 
         for entry in self.meta_by_key.iter() {
@@ -106,7 +150,7 @@ impl CacheCore {
                     dead = true;
                 }
             }
-            if !dead && !live.is_empty() && !live.contains(&entry.chunk_id) {
+            if !dead && !live.contains(&entry.chunk_id) {
                 dead = true;
             }
             if dead {

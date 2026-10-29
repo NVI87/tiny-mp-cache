@@ -1,7 +1,8 @@
 use crate::core::CacheCore;
 use crate::error::CacheError;
 use crate::meta::{
-    load_keys_meta, load_or_init_state, save_keys_meta, save_state, Paths, StateMeta,
+    load_chunks, load_keys_meta, load_or_init_state, save_keys_meta, save_state, Paths,
+    StateMeta,
 };
 use crate::wal::{Wal, WalRecord};
 use pyo3::exceptions::PyRuntimeError;
@@ -84,13 +85,17 @@ impl PersistentCore {
         let core = CacheCore::new();
 
         load_keys_meta(&paths, &core)?;
+        core.bump_next_key_id();
+        load_chunks(&paths, &core, &state.live_chunks)?;
+        let orphans = core.drop_meta_without_values();
+        if orphans > 0 {
+            eprintln!("TinyCache: dropped {} keys without values in chunks", orphans);
+        }
 
         let wal = Wal::open(paths.wal_log())?;
         wal.replay(&core, state.current_chunk_id)?;
 
-        if !state.live_chunks.is_empty() {
-            core.gc(&state.live_chunks);
-        }
+        core.gc(&state.live_chunks, state.current_chunk_id);
 
         let this = Arc::new(PersistentCore {
             paths,
@@ -143,7 +148,7 @@ impl PersistentCore {
             }
         }
 
-        self.core.gc(&state.live_chunks);
+        self.core.gc(&state.live_chunks, state.current_chunk_id);
 
         let current_chunk_id = state.current_chunk_id;
         let live = self.core.export_live_for_chunk(current_chunk_id);
